@@ -1,0 +1,436 @@
+===========================================================
+ PERCORSI E COMANDI: WINDOWS vs RASPBERRY PI
+===========================================================
+
+Il progetto vive in due posti diversi, uno per macchina.
+In tutta questa guida, dove compare "cartella del progetto"
+si intende:
+
+  Windows (PC di sviluppo)
+    C:\Users\Admin\Desktop\camera
+
+  Raspberry Pi (Linux)
+    /home/pi/Desktop/camera
+
+Non e' un errore che siano diversi: sono due sistemi
+operativi con due modi di organizzare le cartelle. Windows
+parte da C:\Users\<nome>, Linux da /home/<nome>.
+
+Il percorso conta davvero, non e' solo estetica: il server
+cerca certs/cert.pem e users.db PARTENDO dalla cartella
+in cui viene avviato. Se lo lanci da un'altra cartella, non li
+trova.
+
+Anche i comandi cambiano, perche' cambia il terminale
+(PowerShell su Windows, bash su Linux):
+
+  entrare nella cartella
+    Windows ->  cd C:\Users\Admin\Desktop\camera
+    Pi      ->  cd /home/pi/Desktop/camera
+
+  attivare l'ambiente virtuale Python
+    Windows ->  .\.venv\Scripts\Activate.ps1
+    Pi      ->  source /home/pi/my_env/bin/activate
+
+  separatore dei percorsi
+    Windows ->  \  (barra rovesciata)
+    Pi      ->  /  (barra normale)
+
+Da qui in poi ogni comando indica a quale delle due macchine
+appartiene. I comandi Python (python server_fastapi.py,
+python manage_users.py ...) sono invece identici sui due
+sistemi, una volta attivato l'ambiente virtuale.
+
+
+===========================================================
+ BACKEND (FastAPI)
+===========================================================
+
+I comandi di questa sezione sono per WINDOWS (sviluppo).
+Per il Raspberry vedi la sezione DEPLOY SUL RASPBERRY PI.
+
+Ci sono due modi per avviarlo. Cambia una cosa sola: se il
+server si riavvia da solo quando modifichi il codice.
+
+
+--- MODO 1: durante lo sviluppo (si riavvia da solo) -------
+
+.\.venv\Scripts\Activate.ps1
+python -m uvicorn server_fastapi:app --reload
+
+Ogni volta che salvi un file .py, il server riparte da solo
+con le modifiche. E' il modo comodo mentre lavori.
+
+!!! ATTENZIONE !!!
+In questo modo HOST scritto dentro .env viene IGNORATO.
+Motivo: uvicorn decide l'indirizzo PRIMA di aprire il tuo
+codice, quindi load_dotenv() arriva troppo tardi. Risultato:
+si mette in ascolto su 127.0.0.1 (solo questo PC) e dagli
+altri dispositivi il browser dice "connessione non riuscita".
+
+Per la rete locale devi scriverlo nel comando:
+
+  python -m uvicorn server_fastapi:app --reload --host 0.0.0.0
+
+Verifica di quale indirizzo sta usando: appena parte scrive
+"Uvicorn running on http://..." -> deve dire 0.0.0.0,
+NON 127.0.0.1.
+
+
+--- MODO 2: avvio diretto (NON si riavvia da solo) ---------
+
+.\.venv\Scripts\Activate.ps1
+python server_fastapi.py
+
+Legge indirizzo e porta da .env (HOST e PORT). Se modifichi
+il codice devi fermarlo (Ctrl+C) e riavviarlo a mano.
+Adatto per farlo partire sul Raspberry, non per sviluppare.
+
+Perche' qui non c'e' il riavvio automatico: per ripartire,
+il programma deve essere rieseguito da capo, e questo fa
+richiedere di nuovo i pin GPIO 17/27/22 che sono gia'
+occupati -> errore "GPIOPinInUse". Spiegazione completa nel
+commento in fondo a server_fastapi.py.
+
+
+--- DATABASE ----------------------------
+
+I database non sono cifrati: non serve alcuna passphrase per
+avviare il server. Basta lanciare python server_fastapi.py
+(vedi i modi sopra).
+
+
+--- Note valide per entrambi i modi ------------------------
+
+SESSION_SECRET: viene letta da .env in automatico
+(load_dotenv), non serve impostarla a mano nel terminale.
+Senza di essa il server si rifiuta di partire.
+
+Per default il server risponde solo a questo computer.
+Per farlo raggiungere da altri PC della stessa rete
+(es. il frontend su un altro computer):
+
+  MODO 1 ->  python -m uvicorn server_fastapi:app --host 0.0.0.0
+  MODO 2 ->  scrivi  HOST=0.0.0.0  dentro il file .env
+
+
+===========================================================
+ FRONTEND (React + Vite)
+===========================================================
+
+In un SECONDO terminale (il primo resta occupato dal
+backend):
+
+cd frontend
+npm run dev
+
+Poi apri nel browser l'indirizzo che stampa
+(di solito http://localhost:5173).
+
+Questo serve SOLO durante lo sviluppo. In produzione il
+frontend viene compilato e servito dal backend stesso
+(vedi sotto): un solo server, una sola porta.
+
+
+===========================================================
+ PRIMO ACCESSO: creare un utente
+===========================================================
+
+L'app ora chiede nome utente e password. La chiave API non
+esiste piu': era scritta dentro il JavaScript, quindi la
+riceveva chiunque aprisse la pagina.
+
+Il primo account va creato da terminale, perche' la pagina
+che gestisce gli utenti richiede di essere gia' entrati come
+amministratore:
+
+  su WINDOWS
+    cd C:\Users\Admin\Desktop\camera
+    .\.venv\Scripts\Activate.ps1
+    python manage_users.py --ask-key add mario
+
+  sul RASPBERRY PI
+    cd /home/pi/Desktop/camera
+    source /home/pi/my_env/bin/activate
+    python manage_users.py --ask-key add mario
+
+Gli account NON si copiano da una macchina all'altra: ogni
+macchina ha il suo users.db, quindi questo comando va dato
+su entrambe (una volta sola per macchina).
+
+La password si digita al buio (non compare a schermo, non
+resta nella cronologia del terminale). Minimo 8 caratteri.
+Il primo account diventa automaticamente amministratore.
+
+Altri comandi:
+
+  python manage_users.py --ask-key list          elenca gli account
+  python manage_users.py --ask-key passwd mario  cambia la password
+  python manage_users.py --ask-key role mario operatore
+  python manage_users.py --ask-key delete mario  elimina un account
+
+Dopo il primo accesso, gli amministratori gestiscono gli
+utenti dalla pagina di amministrazione, su /admin/ (il
+pulsante "Amministrazione" nel pannello di destra): creare,
+rinominare, cambiare ruolo, reimpostare la password,
+eliminare, e disconnettere ovunque.
+
+La sessione dura 7 giorni per dispositivo. Riavviare il
+server NON scollega nessuno, perche' la sessione e' firmata
+dentro il cookie e non salvata nel server.
+
+Il file users.db contiene gli hash delle password ed e'
+cifrato: e' escluso da git e non va condiviso.
+
+
+===========================================================
+ HTTPS / FOTOCAMERA DEL TELEFONO
+===========================================================
+
+Il pulsante "Fotocamera di questo dispositivo" fa in modo
+che sia IL TUO TELEFONO a catturare il video e a mandarlo
+al server, che ci fa sopra il riconoscimento oggetti.
+
+Per funzionare serve HTTPS: i browser danno accesso alla
+fotocamera solo su https:// oppure su localhost. Su
+http://192.168.1.104:8000 il telefono rifiuta sempre.
+
+Il certificato e' gia' stato creato in certs/ (vale 10 anni
+e include gli IP 192.168.1.104 / .105, localhost e
+raspberrypi.local).
+
+In .env sono gia' impostati:
+  SSL_CERTFILE=certs/cert.pem
+  SSL_KEYFILE=certs/key.pem
+
+Avvio:
+  python server_fastapi.py
+
+Deve stampare "Uvicorn running on https://0.0.0.0:8000"
+(https, non http). Poi dal telefono apri:
+
+  https://192.168.1.104:8000
+
+Il telefono mostrera' un avviso "connessione non sicura":
+e' normale, il certificato non e' firmato da un'autorita'
+riconosciuta. Accetta ("Avanzate" -> "Procedi") una volta.
+
+Se avvii con il comando uvicorn invece, i certificati vanno
+passati a mano (come per --host):
+
+  python -m uvicorn server_fastapi:app --host 0.0.0.0 \
+      --ssl-certfile certs/cert.pem --ssl-keyfile certs/key.pem
+
+NOTA: certs/key.pem e' una chiave privata. Non condividerla
+e non metterla in un repository pubblico.
+
+Se cambia l'IP del server, il certificato va rigenerato con
+il nuovo indirizzo:
+
+  openssl req -x509 -newkey rsa:2048 -nodes \
+    -keyout certs/key.pem -out certs/cert.pem -days 3650 \
+    -subj "/CN=NUOVO_IP" \
+    -addext "subjectAltName=IP:NUOVO_IP,IP:127.0.0.1,DNS:localhost"
+
+
+===========================================================
+ DEPLOY SUL RASPBERRY PI (un solo server, porta 8000)
+===========================================================
+
+Idea: si compila il frontend in file statici, e FastAPI li
+serve insieme alle API. Un solo indirizzo per tutto, e
+nessun problema di CORS (pagina e API stessa origine).
+
+
+--- 1. Compila il frontend (sul PC Windows) ----------------
+
+cd frontend
+npm run build
+
+Crea la cartella frontend/dist. Grazie a .env.production
+gli URL sono relativi, quindi dist funziona con QUALSIASI
+indirizzo: non va ricompilato se cambia l'IP del Raspberry.
+
+
+--- 2. Copia sul Raspberry --------------------------------
+
+Comando da dare sul PC WINDOWS, dalla cartella del progetto
+(C:\Users\Admin\Desktop\camera).
+
+Copia il progetto SENZA node_modules e SENZA .venv, ma CON
+frontend/dist. Cosi' sul Pi non serve installare Node.
+
+Prima crea la cartella di destinazione sul Pi:
+
+  ssh pi@<ip-del-pi> "mkdir -p /home/pi/Desktop/camera/frontend"
+
+Poi copia:
+
+  scp -r server_fastapi.py camera.py detection.py detections.py \
+      objects.py object_augment.py object_dupes.py object_localisers.py \
+      classifier_detection.py text_reader.py notifications.py \
+      users.py manage_users.py \
+      scripts requirements.txt .env \
+      pi@<ip-del-pi>:/home/pi/Desktop/camera/
+
+  scp -r frontend/dist pi@<ip-del-pi>:/home/pi/Desktop/camera/frontend/
+
+NON copiare users.db: ogni macchina ha il suo,
+sono cifrati con la SUA passphrase, e contengono dati
+biometrici di persone reali. Non devono uscire da qui.
+
+(dist va copiato con il suo comando, dentro frontend/: un unico scp con
+frontend/dist lo metterebbe in camera/dist e il server non lo troverebbe)
+
+NON si copiano .venv e certs/:
+  .venv  contiene programmi compilati per Windows, inutili
+         su Linux (e i percorsi sono quelli del PC)
+  certs/ contiene una chiave privata, e va rigenerata sul Pi
+         con il suo indirizzo (punto 5)
+
+
+--- 3. Installa le dipendenze Python (sul Pi) -------------
+
+Da qui in poi i comandi sono sul RASPBERRY PI.
+
+cd /home/pi/Desktop/camera
+python3 -m venv --system-site-packages /home/pi/my_env
+source /home/pi/my_env/bin/activate
+pip install -r requirements.txt
+
+ATTENZIONE a --system-site-packages: picamera2 su Raspberry
+OS e' installato a livello di sistema (apt), NON con pip.
+Senza quell'opzione il venv non lo vede e la Pi Camera non
+funziona.
+
+L'ambiente sta FUORI dalla cartella del progetto, in
+/home/pi/my_env. Cosi' non finisce nei backup ne' nelle copie
+del progetto, e resta al suo posto se la cartella camera
+viene ricreata da zero.
+
+
+--- 4. Configura .env (sul Pi) ----------------------------
+
+SESSION_SECRET=...     (firma i cookie di sessione; il file
+                        .env copiato dal PC ne contiene gia'
+                        uno, va bene tenerlo)
+HOST=0.0.0.0           (raggiungibile dalla rete)
+PORT=8000
+CAMERA_SOURCE=picamera (se usi la Pi Camera. Senza questa riga nessuna
+                        camera parte da sola: la webcam si accende con il
+                        pulsante « Condividi la webcam »)
+SSL_CERTFILE=certs/cert.pem
+SSL_KEYFILE=certs/key.pem
+
+Non esiste piu' nessun API_KEY: l'accesso ora avviene con
+nome utente e password (vedi punto 6).
+
+
+--- 5. Certificato HTTPS (sul Pi) -------------------------
+
+La cartella certs/ NON viene copiata dal PC: contiene una
+chiave privata, ed e' esclusa da git per questo motivo.
+Va quindi creata sul Pi, altrimenti il server si ferma
+subito dicendo che il file indicato in SSL_CERTFILE non
+esiste.
+
+Il certificato che sta sul PC Windows NON va bene sul Pi:
+e' intestato a 192.168.1.104 (l'IP del PC), mentre il Pi ha
+un indirizzo diverso. Va quindi creato sul Pi, indicando
+l'IP del Pi al posto di <ip-del-pi>:
+
+  cd /home/pi/Desktop/camera
+  mkdir -p certs
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+    -keyout certs/key.pem -out certs/cert.pem \
+    -subj "/CN=<ip-del-pi>" \
+    -addext "subjectAltName=IP:<ip-del-pi>,IP:127.0.0.1,DNS:localhost,DNS:raspberrypi.local"
+
+L'IP del Pi lo vedi con:
+
+  hostname -I
+
+subjectAltName elenca gli indirizzi per cui il certificato
+vale. Se l'indirizzo usato nel browser non e' in questa
+lista, l'avviso di sicurezza ricompare ogni volta.
+
+Serve HTTPS perche' i browser danno accesso alla fotocamera
+del dispositivo solo su https:// (o localhost). Il
+certificato e' autofirmato: la prima volta ogni browser
+mostra un avviso da accettare una sola volta.
+
+
+--- 6. Crea il primo utente (sul Pi) ----------------------
+
+Senza account nessuno puo' entrare, e la pagina che crea gli
+account richiede a sua volta di essere gia' entrati come
+amministratore. Il primo va quindi creato da riga di
+comando; il primo account e' automaticamente amministratore.
+
+  cd /home/pi/Desktop/camera
+  source /home/pi/my_env/bin/activate
+  python manage_users.py --ask-key add mario
+
+La password si digita senza che appaia a schermo, quindi non
+finisce nella cronologia dei comandi.
+
+Gli account stanno in users.db, creato sul Pi da questo
+comando: non copiarlo dal PC.
+
+
+--- 7. Avvia ----------------------------------------------
+
+cd /home/pi/Desktop/camera
+source /home/pi/my_env/bin/activate
+python server_fastapi.py
+
+Da qualsiasi dispositivo della rete, apri:
+
+  https://<ip-del-pi>:8000
+
+Pagina web E API sullo stesso indirizzo e stessa porta.
+
+
+--- 8. Avvio automatico all'accensione (opzionale) --------
+
+Serve solo se vuoi che il server parta da solo quando accendi
+il Pi. Avviarlo a mano (punto 7) funziona senza tutto questo.
+
+NOTA sul nome utente: qui e in tutta la guida il nome utente
+del Pi e' "pi", da cui il percorso /home/pi/Desktop/camera.
+Se sul tuo Pi e' diverso (dal 2022 lo si sceglie durante
+l'installazione), sostituiscilo ovunque. Lo verifichi con:
+
+  whoami
+
+sudo nano /etc/systemd/system/serverfastapi.service
+
+  [Unit]
+  Description=Server FastAPI camera
+  After=network-online.target
+
+  [Service]
+  User=pi
+  WorkingDirectory=/home/pi/Desktop/camera
+  ExecStart=/home/pi/my_env/bin/python server_fastapi.py
+  Restart=always
+
+  [Install]
+  WantedBy=multi-user.target
+
+Perche' i percorsi sono scritti per intero: un servizio non
+ha un terminale, quindi non puo' fare "cd" ne' "source
+/home/pi/my_env/bin/activate". Le due righe li sostituiscono.
+
+  WorkingDirectory  e' la cartella da cui il server parte:
+                    da li' cerca certs/cert.pem e users.db,
+                    che indica con percorsi relativi.
+  ExecStart         indica il python DENTRO my_env, non quello
+                    di sistema: e' l'unico che vede i
+                    pacchetti installati con pip. Scriverlo
+                    per intero e' cio' che sostituisce
+                    l'attivazione dell'ambiente virtuale.
+
+sudo systemctl enable --now serverfastapi
+sudo systemctl status serverfastapi     (per controllare)
+journalctl -u serverfastapi -f          (per i log)

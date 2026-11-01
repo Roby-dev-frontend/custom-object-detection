@@ -1,0 +1,12 @@
+{
+  "env": { "browser": true, "es2024": true },
+  "rules": {
+    "no-undef": "error"
+  },
+  "overrides": [
+    {
+      "files": ["scripts/**"],
+      "env": { "node": true, "browser": false }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+# Backend Python per custom-object-detection
+# Generato dall'ambiente di sviluppo: verificare le versioni con `pip freeze`
+# dopo aver creato l'ambiente virtuale di produzione.
+
+fastapi>=0.100.0
+uvicorn>=0.20.0
+slowapi>=0.1.0
+pydantic>=2.0.0
+typing-extensions>=4.0.0
+opencv-python-headless>=4.5.0
+ultralytics>=8.0.0
+numpy>=1.21.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.0
+cryptography==41.0.7
+websockets>=10.0

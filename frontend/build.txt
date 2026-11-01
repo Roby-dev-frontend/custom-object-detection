@@ -1,0 +1,121 @@
+﻿
+> custom-object-detection@0.0.0 prebuild
+> npm run copy-wasm && npm run lint
+
+
+> custom-object-detection@0.0.0 copy-wasm
+> node scripts/copy-wasm.mjs
+
+copy-wasm: 0 copied, 5 already current
+
+> custom-object-detection@0.0.0 lint
+> oxlint --deny no-undef
+
+src/admin/AdminApp.jsx:115:42: warning unicorn(no-single-promise-in-promise-methods): Wrapping single-element array with `Promise.all()` is unnecessary. help: Either use the value directly, or switch to `Promise.resolve(…)`.
+src/detection/draw.js:36:10: warning eslint(no-unused-vars): Function 'fitText' is declared but never used. help: Consider removing this declaration.
+src/App.jsx:8922:10: warning eslint(no-unused-vars): Variable 'setupData' is declared but never used. Unused variables should start with a '_'. help: Consider removing this declaration.
+
+> custom-object-detection@0.0.0 build
+> vite build
+
+[36mvite v8.3.5 [32mbuilding client environment for production...[36m[39m
+transforming...
+✓ 869 modules transformed.
+node.exe : [31m✗[39m Build failed in 1.32s
+In riga:1 car:1
++ & "C:\Program Files\nodejs/node.exe" "C:\Users\Admin\AppData\Roaming\ ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ([31m✗[39m Build failed in 1.32s:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+[31merror during build:
+[31mBuild failed with 4 errors:
+
+[31m[UNRESOLVED_IMPORT] [0mCould not resolve './detection/faces' in src/App.jsx
+    [38;5;246m╭[0m[38;5;246m─[0m[38;5;246m[[0m src/App.jsx:11:45 [38;5;246m][0m
+    [38;5;246m│[0m
+ [38;5;246m11 │[0m 
+[38;5;249mi[0m[38;5;249mm[0m[38;5;249mp[0m[38;5;249mo[0m[38;5;249mr[0m[38;5;249mt[0m[38;5;249m 
+[0m[38;5;249m{[0m[38;5;249m [0m[38;5;249mF[0m[38;5;249ma[0m[38;5;249mc[0m[38;5;249me[0m[38;5;249mT[0m[3
+8;5;249mr[0m[38;5;249ma[0m[38;5;249mc[0m[38;5;249mk[0m[38;5;249me[0m[38;5;249mr[0m[38;5;249m,[0m[38;5;249
+m [0m[38;5;249mc[0m[38;5;249mr[0m[38;5;249mo[0m[38;5;249mp[0m[38;5;249mF[0m[38;5;249ma[0m[38;5;249mc[0m
+[38;5;249me[0m[38;5;249mT[0m[38;5;249mo[0m[38;5;249mJ[0m[38;5;249mp[0m[38;5;249me[0m[38;5;249mg[0m[38;5;2
+49m [0m[38;5;249m}[0m[38;5;249m [0m[38;5;249mf[0m[38;5;249mr[0m[38;5;249mo[0m[38;5;249mm[0m[38;5;249m 
+[0m"./detection/faces"[38;5;249m;[0m
+ [38;5;240m   │[0m                                             ─────────┬─────────  
+ [38;5;240m   │[0m                                                      ╰─────────── Module not found.
+ [38;5;240m   │[0m 
+ [38;5;240m   │[0m [38;5;115mHelp[0m: 'src/App.jsx' is imported by the following path:
+ [38;5;240m   │[0m         - src/App.jsx
+ [38;5;240m   │[0m         - src/main.jsx
+ [38;5;240m   │[0m         - index.html
+[38;5;246m────╯[0m
+
+[31m[UNRESOLVED_IMPORT] [0mCould not resolve './FaceDetail' in src/App.jsx
+    [38;5;246m╭[0m[38;5;246m─[0m[38;5;246m[[0m src/App.jsx:16:24 [38;5;246m][0m
+    [38;5;246m│[0m
+ [38;5;246m16 │[0m 
+[38;5;249mi[0m[38;5;249mm[0m[38;5;249mp[0m[38;5;249mo[0m[38;5;249mr[0m[38;5;249mt[0m[38;5;249m [0m[38;5;
+249mF[0m[38;5;249ma[0m[38;5;249mc[0m[38;5;249me[0m[38;5;249mD[0m[38;5;249me[0m[38;5;249mt[0m[38;5;249ma[
+0m[38;5;249mi[0m[38;5;249ml[0m[38;5;249m 
+[0m[38;5;249mf[0m[38;5;249mr[0m[38;5;249mo[0m[38;5;249mm[0m[38;5;249m [0m"./FaceDetail"[38;5;249m;[0m
+ [38;5;240m   │[0m                        ───────┬──────  
+ [38;5;240m   │[0m                               ╰──────── Module not found.
+ [38;5;240m   │[0m 
+ [38;5;240m   │[0m [38;5;115mHelp[0m: 'src/App.jsx' is imported by the following path:
+ [38;5;240m   │[0m         - src/App.jsx
+ [38;5;240m   │[0m         - src/main.jsx
+ [38;5;240m   │[0m         - index.html
+[38;5;246m────╯[0m
+
+[31m[UNRESOLVED_IMPORT] [0mCould not resolve './FaceEnrollModal' in src/App.jsx
+    [38;5;246m╭[0m[38;5;246m─[0m[38;5;246m[[0m src/App.jsx:17:29 [38;5;246m][0m
+    [38;5;246m│[0m
+ [38;5;246m17 │[0m 
+[38;5;249mi[0m[38;5;249mm[0m[38;5;249mp[0m[38;5;249mo[0m[38;5;249mr[0m[38;5;249mt[0m[38;5;249m [0m[38;5;
+249mF[0m[38;5;249ma[0m[38;5;249mc[0m[38;5;249me[0m[38;5;249mE[0m[38;5;249mn[0m[38;5;249mr[0m[38;5;249mo[
+0m[38;5;249ml[0m[38;5;249ml[0m[38;5;249mM[0m[38;5;249mo[0m[38;5;249md[0m[38;5;249ma[0m[38;5;249ml[0m[38;
+5;249m [0m[38;5;249mf[0m[38;5;249mr[0m[38;5;249mo[0m[38;5;249mm[0m[38;5;249m 
+[0m"./FaceEnrollModal"[38;5;249m;[0m
+ [38;5;240m   │[0m                             ─────────┬─────────  
+ [38;5;240m   │[0m                                      ╰─────────── Module not found.
+ [38;5;240m   │[0m 
+ [38;5;240m   │[0m [38;5;115mHelp[0m: 'src/App.jsx' is imported by the following path:
+ [38;5;240m   │[0m         - src/App.jsx
+ [38;5;240m   │[0m         - src/main.jsx
+ [38;5;240m   │[0m         - index.html
+[38;5;246m────╯[0m
+
+[31m[UNRESOLVED_IMPORT] [0mCould not resolve './FaceRecord' in src/App.jsx
+    [38;5;246m╭[0m[38;5;246m─[0m[38;5;246m[[0m src/App.jsx:18:24 [38;5;246m][0m
+    [38;5;246m│[0m
+ [38;5;246m18 │[0m 
+[38;5;249mi[0m[38;5;249mm[0m[38;5;249mp[0m[38;5;249mo[0m[38;5;249mr[0m[38;5;249mt[0m[38;5;249m [0m[38;5;
+249mF[0m[38;5;249ma[0m[38;5;249mc[0m[38;5;249me[0m[38;5;249mR[0m[38;5;249me[0m[38;5;249mc[0m[38;5;249mo[
+0m[38;5;249mr[0m[38;5;249md[0m[38;5;249m 
+[0m[38;5;249mf[0m[38;5;249mr[0m[38;5;249mo[0m[38;5;249mm[0m[38;5;249m [0m"./FaceRecord"[38;5;249m;[0m
+ [38;5;240m   │[0m                        ───────┬──────  
+ [38;5;240m   │[0m                               ╰──────── Module not found.
+ [38;5;240m   │[0m 
+ [38;5;240m   │[0m [38;5;115mHelp[0m: 'src/App.jsx' is imported by the following path:
+ [38;5;240m   │[0m         - src/App.jsx
+ [38;5;240m   │[0m         - src/main.jsx
+ [38;5;240m   │[0m         - index.html
+[38;5;246m────╯[0m
+[31m
+    at aggregateBindingErrorsIntoJsError (file:///C:/Users/Admin/Desktop/custom-object-detection/frontend/node_modules/
+rolldown/dist/shared/error-BJ9uQLIS.mjs:50:18)
+    at unwrapBindingResult (file:///C:/Users/Admin/Desktop/custom-object-detection/frontend/node_modules/rolldown/dist/
+shared/error-BJ9uQLIS.mjs:20:128)
+    at #build (file:///C:/Users/Admin/Desktop/custom-object-detection/frontend/node_modules/rolldown/dist/shared/rolldo
+wn-DWd2aEL4.mjs:146:34)
+    at async buildEnvironment 
+(file:///C:/Users/Admin/Desktop/custom-object-detection/frontend/node_modules/vite/dist/node/chunks/node.js:34849:66)
+    at async Object.build 
+(file:///C:/Users/Admin/Desktop/custom-object-detection/frontend/node_modules/vite/dist/node/chunks/node.js:35270:19)
+    at async Object.buildApp 
+(file:///C:/Users/Admin/Desktop/custom-object-detection/frontend/node_modules/vite/dist/node/chunks/node.js:35267:153)
+    at async CAC.<anonymous> 
+(file:///C:/Users/Admin/Desktop/custom-object-detection/frontend/node_modules/vite/dist/node/cli.js:790:3) {
+  errors: [Getter/Setter]
+}[39m
