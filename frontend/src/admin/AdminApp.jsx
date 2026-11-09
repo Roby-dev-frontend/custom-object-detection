@@ -112,7 +112,7 @@ export default function AdminApp() {
           setState("forbidden");
           return;
         }
-        const [userData] = await Promise.all([get("/users")]);
+        const userData = await get("/users");
         if (cancelled) return;
         setUsers(userData.users ?? []);
         setRoles(userData.roles ?? []);

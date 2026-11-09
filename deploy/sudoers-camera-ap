@@ -1,0 +1,16 @@
+# Lets the user running the camera server flip the access point without a
+# password -- and lets it do nothing else.
+#
+# Installed to /etc/sudoers.d/camera-ap (root:root, 0440) by
+# deploy/install-ap.sh, which validates it with `visudo -c` first: a syntax
+# error in this directory locks sudo for every user on the machine.
+#
+# The three commands are spelled out in full WITH their arguments. That is the
+# whole security model: `camera-ap` alone would let any argument through, and
+# the wildcard `camera-ap *` would too. Listing the exact words means the app
+# can turn the access point on, off, or ask about it, and nothing more -- there
+# is no argument it can pass that reaches anything else on the system.
+
+pi ALL=(root) NOPASSWD: /usr/local/sbin/camera-ap on
+pi ALL=(root) NOPASSWD: /usr/local/sbin/camera-ap off
+pi ALL=(root) NOPASSWD: /usr/local/sbin/camera-ap status

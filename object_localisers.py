@@ -2,17 +2,16 @@
 
 WHY THIS FILE EXISTS SEPARATELY
 -------------------------------
-For an object nobody has trained for there is nothing that says "something is
-here" -- no detector that can say where to look -- and without that an
-embedding can answer "is the object in view?" but can never draw a box round
-it.
+Custom-object detection needs both a location and a similarity score: the
+classifier has to find the measured object in a new frame, not just label a
+pre-existing crop.
 
 There is no way to know from reading code which substitute works for a
 particular object: it is a property of the object, not of the algorithm. So all
 three are implemented, measured against real photographs, and the winner is
 chosen from the numbers.
 
-Pure vision: no database, no passphrase, no HTTP. That is deliberate, and it is
+Pure vision: no database, no HTTP. That is deliberate, and it is
 what lets the same code serve both front doors -- scripts/object_bench.py on
 the command line, and POST /objects/measure from the app -- without either
 growing its own copy that can drift.
@@ -31,8 +30,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # Already in the project root: the app serves this file to the browser.
 EFFICIENTDET_PATH = os.path.join(_HERE, "efficientdet_lite0.tflite")
 
-# The embedder both halves of the app would use. 4.1 MB, fetched on first use
-# the way detection.py already fetches hand_landmarker.task.
+# The embedder shared by the custom-classifier tools. 4.1 MB, fetched on first
+# use.
 EMBEDDER_PATH = os.path.join(_HERE, "mobilenet_v3_small.tflite")
 EMBEDDER_URL = (
     "https://storage.googleapis.com/mediapipe-models/image_embedder"

@@ -10,17 +10,15 @@ it the way back in if the web side ever locks out the only administrator.
 Passwords are typed invisibly (getpass), so they never appear on screen, in the
 shell history, or in any file.
 
-The accounts live in an encrypted database, so every command needs its
-passphrase. `--ask-key` goes BEFORE the subcommand -- it belongs to this
-program, not to `add`:
+The accounts live in users.db, so every command opens that local SQLite store:
 
-    python manage_users.py --ask-key add mario --admin
-    python manage_users.py --ask-key list
-    python manage_users.py --ask-key passwd mario
-    python manage_users.py --ask-key role mario amministratore
-    python manage_users.py --ask-key rename mario marione
-    python manage_users.py --ask-key logout-everywhere mario
-    python manage_users.py --ask-key delete mario
+    python manage_users.py add mario --admin
+    python manage_users.py list
+    python manage_users.py passwd mario
+    python manage_users.py role mario amministratore
+    python manage_users.py rename mario marione
+    python manage_users.py logout-everywhere mario
+    python manage_users.py delete mario
 """
 
 import argparse
@@ -118,11 +116,6 @@ def cmd_delete(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Manage login accounts.")
-    # Top-level, not per-subcommand: the subparsers are required=True, so a
-    # flag defined on them would have to be typed after the subcommand, and
-    # `manage_users.py add --ask-key mario` reads as if it belonged to `add`.
-    parser.add_argument("--ask-key", action="store_true",
-                        help=argparse.SUPPRESS)
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     add = subcommands.add_parser("add", help="create an account")
@@ -157,15 +150,15 @@ def main() -> None:
     delete.set_defaults(func=cmd_delete)
 
     args = parser.parse_args()
-    # Asked BEFORE the command runs, so a mistyped passphrase costs nothing but
-    # the retry -- rather than failing half way through a rename.
+    # Open up front so a missing or unreadable store is reported before a
+    # command begins changing account state.
     try:
         users.connect(users.USERS_DB).close()
     except FileNotFoundError as error:
         print(f"Error: {error}")
         sys.exit(78)
     except Exception as error:                                # noqa: BLE001
-        print(f"Error: {error}")
+        print(f"Error opening {users.USERS_DB}: {error}")
         sys.exit(78)
 
     args.func(args)

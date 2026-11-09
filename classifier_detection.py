@@ -1,7 +1,7 @@
 """Live detection using a named classifier's measured method.
 
-Kept apart from detection.py, which stays free of a database and a
-passphrase, and apart from object_localisers.py, which stays "pure vision"
+Kept apart from detection.py, which stays free of a database, and apart from
+object_localisers.py, which stays "pure vision"
 with no database either (see that module's own docstring). This is the
 glue: it reads objects.db to find which localiser a classifier is measured
 against, builds and caches ONE instance of it, and answers "is the object in
@@ -20,7 +20,8 @@ object_localisers.ProposalLocaliser calls MediaPipe's ObjectDetector and
 ImageEmbedder, which are not documented as safe to call from two threads at
 once -- the same reasoning detection.py applies to the hand landmarker with
 its own _hand_lock. Several threads can reach here: one DetectSession per
-own-camera device, and /camera_feed's threadpool.
+own-camera device, LocalCameraWorker's own detector thread, and /camera_feed's
+threadpool.
 """
 
 import logging

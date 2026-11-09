@@ -86,18 +86,30 @@ Legge indirizzo e porta da .env (HOST e PORT). Se modifichi
 il codice devi fermarlo (Ctrl+C) e riavviarlo a mano.
 Adatto per farlo partire sul Raspberry, non per sviluppare.
 
-Perche' qui non c'e' il riavvio automatico: per ripartire,
-il programma deve essere rieseguito da capo, e questo fa
-richiedere di nuovo i pin GPIO 17/27/22 che sono gia'
-occupati -> errore "GPIOPinInUse". Spiegazione completa nel
-commento in fondo a server_fastapi.py.
+Per lo sviluppo e' preferibile il modo 1, che ricarica il
+server quando modifichi il codice.
 
 
---- DATABASE ----------------------------
+--- DATABASE E ACCOUNT INIZIALI ----------------------------
 
-I database non sono cifrati: non serve alcuna passphrase per
-avviare il server. Basta lanciare python server_fastapi.py
-(vedi i modi sopra).
+I database usano SQLite standard e non richiedono una
+password separata all'avvio. In ambiente locale
+(APP_ENV=local, predefinito), al primo avvio vengono creati
+gli account:
+
+  admin / admin          amministratore
+  operator / operator    operatore
+
+Queste password iniziali sono note: cambiale dalla pagina
+di amministrazione. Il login dell'app resta attivo.
+
+Per disattivare gli account predefiniti, imposta APP_ENV=production
+nel file .env e crea l'amministratore iniziale con:
+
+  python manage_users.py add <nome> --admin
+
+SQLite standard non cifra i dati a riposo: proteggi i file .db
+e le relative copie di backup.
 
 
 --- Note valide per entrambi i modi ------------------------
@@ -133,41 +145,36 @@ frontend viene compilato e servito dal backend stesso
 
 
 ===========================================================
- PRIMO ACCESSO: creare un utente
+ PRIMO ACCESSO: account predefiniti
 ===========================================================
 
-L'app ora chiede nome utente e password. La chiave API non
-esiste piu': era scritta dentro il JavaScript, quindi la
-riceveva chiunque aprisse la pagina.
+Al primo avvio l'app crea automaticamente questi account:
 
-Il primo account va creato da terminale, perche' la pagina
-che gestisce gli utenti richiede di essere gia' entrati come
-amministratore:
+  admin / admin          amministratore
+  operator / operator    operatore
+
+Accedi con admin e cambia subito la password dalla pagina
+di amministrazione. Per creare altri utenti puoi usare:
 
   su WINDOWS
     cd C:\Users\Admin\Desktop\camera
     .\.venv\Scripts\Activate.ps1
-    python manage_users.py --ask-key add mario
+    python manage_users.py add mario
 
   sul RASPBERRY PI
     cd /home/pi/Desktop/camera
     source /home/pi/my_env/bin/activate
-    python manage_users.py --ask-key add mario
-
-Gli account NON si copiano da una macchina all'altra: ogni
-macchina ha il suo users.db, quindi questo comando va dato
-su entrambe (una volta sola per macchina).
+    python manage_users.py add mario
 
 La password si digita al buio (non compare a schermo, non
 resta nella cronologia del terminale). Minimo 8 caratteri.
-Il primo account diventa automaticamente amministratore.
 
 Altri comandi:
 
-  python manage_users.py --ask-key list          elenca gli account
-  python manage_users.py --ask-key passwd mario  cambia la password
-  python manage_users.py --ask-key role mario operatore
-  python manage_users.py --ask-key delete mario  elimina un account
+  python manage_users.py list          elenca gli account
+  python manage_users.py passwd mario  cambia la password
+  python manage_users.py role mario operatore
+  python manage_users.py delete mario  elimina un account
 
 Dopo il primo accesso, gli amministratori gestiscono gli
 utenti dalla pagina di amministrazione, su /admin/ (il
@@ -179,8 +186,9 @@ La sessione dura 7 giorni per dispositivo. Riavviare il
 server NON scollega nessuno, perche' la sessione e' firmata
 dentro il cookie e non salvata nel server.
 
-Il file users.db contiene gli hash delle password ed e'
-cifrato: e' escluso da git e non va condiviso.
+Il file users.db contiene gli hash delle password, ma SQLite
+standard non cifra i dati a riposo: proteggi l'accesso al
+computer e non condividere il file.
 
 
 ===========================================================
@@ -275,9 +283,8 @@ Poi copia:
 
   scp -r frontend/dist pi@<ip-del-pi>:/home/pi/Desktop/camera/frontend/
 
-NON copiare users.db: ogni macchina ha il suo,
-sono cifrati con la SUA passphrase, e contengono dati
-biometrici di persone reali. Non devono uscire da qui.
+NON copiare users.db: ogni macchina ha il proprio database
+e i propri account.
 
 (dist va copiato con il suo comando, dentro frontend/: un unico scp con
 frontend/dist lo metterebbe in camera/dist e il server non lo troverebbe)
@@ -360,25 +367,7 @@ certificato e' autofirmato: la prima volta ogni browser
 mostra un avviso da accettare una sola volta.
 
 
---- 6. Crea il primo utente (sul Pi) ----------------------
-
-Senza account nessuno puo' entrare, e la pagina che crea gli
-account richiede a sua volta di essere gia' entrati come
-amministratore. Il primo va quindi creato da riga di
-comando; il primo account e' automaticamente amministratore.
-
-  cd /home/pi/Desktop/camera
-  source /home/pi/my_env/bin/activate
-  python manage_users.py --ask-key add mario
-
-La password si digita senza che appaia a schermo, quindi non
-finisce nella cronologia dei comandi.
-
-Gli account stanno in users.db, creato sul Pi da questo
-comando: non copiarlo dal PC.
-
-
---- 7. Avvia ----------------------------------------------
+--- 6. Avvia ----------------------------------------------
 
 cd /home/pi/Desktop/camera
 source /home/pi/my_env/bin/activate

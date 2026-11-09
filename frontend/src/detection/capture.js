@@ -1,17 +1,8 @@
 /**
- * Grabbing whole frames out of the picture on screen.
- *
- * The sibling cropFaceToJpeg in faces.js cuts ONE face out of the frame,
- * because that is all SFace ever looks at. Gathering photographs of an object
- * is the opposite job: the background has to come too. What makes those photos
- * worth measuring is precisely that the object appears in a real room, at a
- * real distance, with real clutter behind it -- a set of tight crops would
- * prove only that the object matches itself.
- *
- * Read from the source element at its natural size for the same reason
- * cropFaceToJpeg does: the detection canvas the overlay uses is downscaled to
- * a few hundred pixels, and keypoint matching has nothing to hold on to once
- * the texture has been resampled away.
+ * Grabbing whole frames from the picture on screen for classifier training.
+ * The room, distance, and background are part of the useful training example,
+ * so these frames are captured from the full-size source rather than the
+ * downscaled detection overlay.
  */
 
 // Long side of a stored frame. Big enough to keep the texture ORB needs --
@@ -48,10 +39,9 @@ export function frameToJpeg(media, maxSide = CAPTURE_MAX_SIDE, quality = CAPTURE
  * A burst of frames, spaced out in time.
  *
  * The spacing is the whole point: ten frames grabbed in one tick are ten
- * copies of one instant, and a record built from them describes a single pose
- * while looking like it has ten pieces of evidence. faces.py measured exactly
- * that trap on people (ENROL_MAX_SIMILARITY), and an object held in the hand
- * is no different -- the gap is what lets you turn it between shots.
+ * copies of one instant, and a classifier built from them describes a single
+ * pose while looking like it has ten pieces of evidence. The gap lets the
+ * object be moved between shots.
  *
  * @param getMedia  called before every frame, so switching source mid-burst
  *                  cannot keep capturing from an element no longer on screen

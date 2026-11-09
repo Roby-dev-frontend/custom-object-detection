@@ -7,16 +7,13 @@
 // pointer gesture, not an arrangement of inputs. Asked for and approved before
 // it was written.
 //
-// Faces never needed it: YuNet finds the face and the box comes for free. An
-// object nobody has trained for has no such detector, so the one thing only a
-// person can supply is WHICH PIXELS ARE THE OBJECT. That is this component's
-// entire job.
+// The user marks which pixels belong to the custom object.
 //
 // TWO THINGS THAT LOOK LIKE DETAILS AND ARE NOT
 // ---------------------------------------------
 // 1. touch-action. The video overlay elsewhere in this app uses
 //    `touch-manipulation`, which leaves panning to the browser -- correct for
-//    tapping a face, fatal here: the first finger-drag would scroll the page
+//    tapping a video, fatal here: the first finger-drag would scroll the page
 //    instead of drawing anything. The canvas therefore sets `touch-none`, and
 //    only the canvas does, so scrolling everywhere else is untouched. It has to
 //    be set BEFORE the gesture starts, not while it runs: touch-action is
@@ -27,7 +24,7 @@
 //    position is not a picture position, and the naive calculation lands a
 //    consistent distance out -- which reads as "the box is slightly off"
 //    rather than as a bug. detection/hittest.js already inverts that transform
-//    for tapping faces; this reuses it rather than repeating it.
+//    for mapping video points; this reuses it rather than repeating it.
 
 import { useEffect, useRef, useState } from "react";
 import { Text } from "@mantine/core";

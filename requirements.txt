@@ -1,16 +1,57 @@
-# Backend Python per custom-object-detection
-# Generato dall'ambiente di sviluppo: verificare le versioni con `pip freeze`
-# dopo aver creato l'ambiente virtuale di produzione.
-
-fastapi>=0.100.0
-uvicorn>=0.20.0
-slowapi>=0.1.0
-pydantic>=2.0.0
-typing-extensions>=4.0.0
-opencv-python-headless>=4.5.0
-ultralytics>=8.0.0
-numpy>=1.21.0
-python-multipart>=0.0.6
-python-dotenv>=1.0.0
-cryptography==41.0.7
-websockets>=10.0
+# Versions are pinned so that reinstalling gives back the same program, and so
+# that "does this advisory affect us" has an answer. These are the versions
+# this project is actually running on, and every one of them declares support
+# for Python 3.9 and ships a py3-none-any wheel -- checked against PyPI --
+# because the Raspberry here is on 3.9.2 and the Windows machine on 3.9.1.
+# pydantic's compiled half, pydantic-core 2.46.4, has cp39 win32 and win_amd64
+# wheels, so nothing has to be built on Windows either.
+fastapi==0.128.8
+uvicorn[standard]==0.39.0
+pydantic==2.13.4
+python-dotenv==1.2.1
+slowapi==0.1.10
+typing_extensions==4.16.0
+# Used only to create certs/cert.pem and certs/key.pem when they are missing.
+# Replaces shelling out to openssl, which is not on PATH on a normal Windows
+# machine. Not needed if SSL_CERTFILE/SSL_KEYFILE are commented out in .env.
+#
+# 42 and newer build their Rust extension against a CPython that the Windows
+# machine here (Python 3.9.1, December 2020) does not provide: importing it
+# dies with "DLL load failed while importing _rust". 41.0.7 was the last one
+# that loads there. Verified on that machine: 41.0.7 imports, 42.0.8 does not.
+# The Raspberry runs a newer Python and is left free to take a current version.
+#
+# DELIBERATELY NOT PINNED TO AN EXACT VERSION, unlike everything else above.
+# What is installed here is Raspberry Pi OS's own cryptography 3.3.2, from apt;
+# pinning that number would push 3.3.2 onto the Windows machine as well, in
+# place of the 41.0.7 that was tested and found to work there. The two machines
+# genuinely want different builds, which is what these two lines already say.
+cryptography<42 ; python_version < "3.10"
+cryptography ; python_version >= "3.10"
+# Pinned below 5.x / 2.x on purpose. Raspberry Pi OS installs picamera2 via
+# apt, and its C extensions are built against the system numpy 1.x. Pulling in
+# numpy 2 (which opencv-python 5.x requires) makes `import picamera2` die with
+# "numpy.dtype size changed, may indicate binary incompatibility".
+# opencv-contrib-python is pinned too because mediapipe pulls it in and it
+# carries the same numpy>=2 requirement.
+opencv-python==4.11.0.86
+opencv-contrib-python==4.11.0.86
+numpy==1.26.4
+# Pinned for consistent MediaPipe Tasks support across Raspberry Pi and
+# Windows; custom object classifiers use its ObjectDetector and ImageEmbedder.
+mediapipe==0.10.14
+# Reading text from a frame (text_reader.py) uses two engines, for different
+# kinds of text:
+#
+#   scene  ("Etichette": packaging, signs, coloured lettering) -- RapidOCR, which
+#          is a pip package and is pinned below. It runs on the onnxruntime that
+#          mediapipe already brings in.
+#   text / codes ("Testo", "Codici": printed pages, serial numbers) -- Tesseract,
+#          which is NOT a pip package: the `tesseract` PROGRAM has to be on the
+#          machine itself, with its Italian and English language data.
+#            Raspberry:  sudo apt install tesseract-ocr tesseract-ocr-ita tesseract-ocr-eng
+#            Windows:    install Tesseract (tick the Italian data) and put it on the PATH
+#
+# Without either the app runs normally and only the mode that needs it answers,
+# with this instruction, instead of a reading.
+rapidocr-onnxruntime==1.4.4

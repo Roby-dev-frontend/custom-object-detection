@@ -1,4 +1,4 @@
-﻿openapi: 3.1.0
+openapi: 3.1.0
 info:
   title: Telecamera API
   description: Every route except POST /login needs a logged-in session (cookie from POST /login); the
@@ -985,64 +985,6 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /command:
-    post:
-      summary: Run Command
-      operationId: run_command_command_post
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CommandRequest'
-        required: true
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                additionalProperties: true
-                type: object
-                title: Response Run Command Command Post
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-  /detections:
-    post:
-      summary: Report Detections
-      description: 'Where the browser sends what it detected, so the server can act on it.
-
-
-        The page draws its own boxes; nothing here affects what it displays. This
-
-        exists purely so detection moving off the Pi does not also move it out of
-
-        reach of the hardware attached to the Pi.'
-      operationId: report_detections_detections_post
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/DetectionsRequest'
-        required: true
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                additionalProperties: true
-                type: object
-                title: Response Report Detections Detections Post
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
   /presence:
     post:
       summary: Presence
@@ -1296,47 +1238,6 @@ paths:
                 additionalProperties: true
                 type: object
                 title: Response Camera Devices Camera Devices Get
-  /detection_classes:
-    get:
-      summary: Detection Classes
-      description: 'The COCO classes yolov8n can detect, so the frontend''s picker stays in
-
-        sync with COCO_CLASSES instead of hardcoding a copy that could drift out
-
-        of step with the indices the backend actually filters on.'
-      operationId: detection_classes_detection_classes_get
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                additionalProperties: true
-                type: object
-                title: Response Detection Classes Detection Classes Get
-  /models/{name}:
-    get:
-      summary: Browser Model
-      operationId: browser_model_models__name__get
-      parameters:
-      - name: name
-        in: path
-        required: true
-        schema:
-          type: string
-          title: Name
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema: {}
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
   /video_feed:
     get:
       summary: Video Feed
@@ -1619,66 +1520,17 @@ components:
       - into
       - images
       title: CaptureRequest
-      description: 'Frames to keep, and which of the two sets they belong to.
-
-
-        `into` is a Literal rather than a string: the value becomes a directory
-
-        name, and a caller-supplied path here would reach faces.db and .env. Two
-
-        words are the entire vocabulary, so pydantic refuses everything else before
-
-        this code ever runs -- the same reasoning as the allow-list in
-
-        /models/{name} and the name pattern in /faces/photo/{name}.'
-    CommandRequest:
-      properties:
-        command:
-          type: string
-          enum:
-          - button1
-          - button2
-          - button3
-          title: Command
-      type: object
-      required:
-      - command
-      title: CommandRequest
+      description: Frames to keep for measuring a custom classifier. The into value is limited to the
+        two capture sets.
     DetectionConfigRequest:
       properties:
         backend:
           anyOf:
           - type: string
             enum:
-            - mediapipe
-            - yolo
-            - face
             - classifier
           - type: 'null'
           title: Backend
-        yolo_classes:
-          anyOf:
-          - items:
-              type: integer
-            type: array
-          - type: 'null'
-          title: Yolo Classes
-        location:
-          anyOf:
-          - type: string
-            enum:
-            - browser
-            - server
-          - type: 'null'
-          title: Location
-        num_hands:
-          anyOf:
-          - type: integer
-            enum:
-            - 1
-            - 2
-          - type: 'null'
-          title: Num Hands
         object_id:
           anyOf:
           - type: string
@@ -1694,25 +1546,6 @@ components:
       description: 'Mirrors detection.DETECTION_CONFIG. Every field optional so callers can
 
         send just the part they want to change.'
-    DetectionsRequest:
-      properties:
-        source:
-          type: string
-          enum:
-          - picamera
-          - usb
-          - remote
-          title: Source
-        detections:
-          items:
-            $ref: '#/components/schemas/ReportedDetection'
-          type: array
-          title: Detections
-      type: object
-      required:
-      - source
-      - detections
-      title: DetectionsRequest
     EntryTextRequest:
       properties:
         text:
@@ -1736,14 +1569,6 @@ components:
           title: Ids
       type: object
       title: ExportRequest
-
-        Several rather than one because averaging the embeddings across a short
-
-        burst is what makes recognition survive a phone being carried while
-
-        walking -- measured worst case improves from 0.539 to 0.594, with no rise
-
-        in the score against strangers.'
     HTTPValidationError:
       properties:
         detail:
@@ -1969,35 +1794,6 @@ components:
       required:
       - new_username
       title: RenameRequest
-    ReportedDetection:
-      properties:
-        label:
-          type: string
-          title: Label
-        confidence:
-          anyOf:
-          - type: number
-          - type: 'null'
-          title: Confidence
-        bbox:
-          anyOf:
-          - prefixItems:
-            - type: integer
-            - type: integer
-            - type: integer
-            - type: integer
-            type: array
-            maxItems: 4
-            minItems: 4
-          - type: 'null'
-          title: Bbox
-      type: object
-      required:
-      - label
-      title: ReportedDetection
-      description: 'One detection as the page found it. Same shape as detection.Detection,
-
-        so browser-side and server-side results are interchangeable.'
     RoleRequest:
       properties:
         role:
@@ -2129,18 +1925,8 @@ components:
           default: 95
       type: object
       title: VideoEncodingRequest
-      description: 'How the local camera''s frames should be encoded from now on.
-
-
-        Four rungs are offered in the page; anything in range is accepted here.
-
-        The floor is not arbitrary: a watching page runs face detection at 640 px
-
-        and hand detection at 480 px and never scales a picture UP, so sending less
-
-        than 320 px would start starving the detector rather than merely softening
-
-        the picture.'
+      description: How the local camera's frames should be encoded from now on. Width is bounded and the
+        encoder does not scale a picture up.
     ViewBox:
       properties:
         x:

@@ -12,12 +12,10 @@ answer to the page).
 
 WHAT A FILE IS
 --------------
-A plain, UNENCRYPTED SQLite file (the machine reading it has another
-passphrase, so a file only the writer could open would be an export of
-nothing) holding classifiers only: the object rows, their photographs and
-boxes, which photographs were generated, the template choice and the active
-measurement with the references it was made against. Never faces, users,
-detections or notifications.
+A plain SQLite file holding classifiers only: the object rows, their
+photographs and boxes, which photographs were generated, the template choice
+and the active measurement with the references it was made against. Never
+users, detections or notifications.
 
 TWO LEVELS OF TRUST
 -------------------

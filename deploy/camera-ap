@@ -1,0 +1,116 @@
+#!/bin/bash
+# Turns the Raspberry Pi's own WiFi into an access point, and back again.
+#
+# Installed to /usr/local/sbin/camera-ap, root-owned, by deploy/install-ap.sh.
+# The app calls it through sudo (see deploy/sudoers-camera-ap), which grants
+# these three subcommands and nothing else -- that is why this takes a fixed
+# word rather than any argument the caller chooses.
+#
+#   camera-ap on       wlan0 becomes the access point   (192.168.4.1)
+#   camera-ap off      wlan0 goes back to being a WiFi client
+#   camera-ap status   prints one line of JSON
+#
+# WHY IT DOES NOT EDIT /etc/dhcpcd.conf
+# ------------------------------------
+# The obvious approach is `denyinterfaces wlan0` so dhcpcd keeps its hands off.
+# That works, but it is permanent: wlan0 can then never go back to being a home
+# WiFi client without editing a system file again, which is the opposite of a
+# switch. Instead each direction hands wlan0 over explicitly --
+# `dhcpcd -k wlan0` to take it, `dhcpcd -n wlan0` to give it back -- so
+# /etc/dhcpcd.conf keeps working exactly as it did and is never touched.
+
+set -uo pipefail
+
+IFACE="wlan0"
+AP_ADDR="192.168.4.1/24"
+
+die() { echo "camera-ap: $*" >&2; exit 1; }
+
+[ "$(id -u)" -eq 0 ] || die "must run as root (the app calls it through sudo)"
+
+ap_running() {
+    [ "$(systemctl is-active hostapd 2>/dev/null)" = "active" ]
+}
+
+case "${1:-}" in
+on)
+    # The radio ships soft-blocked on a fresh Raspberry Pi OS and after some
+    # updates. hostapd's failure in that state does not mention rfkill at all,
+    # so clear it every time rather than diagnosing it every time.
+    rfkill unblock wifi || true
+
+    # Take wlan0 away from the client stack, in this order: the supplicant
+    # first, or dhcpcd re-associates underneath us.
+    systemctl stop wpa_supplicant 2>/dev/null || true
+    wpa_cli -i "$IFACE" terminate >/dev/null 2>&1 || true
+    dhcpcd -k "$IFACE" >/dev/null 2>&1 || true
+    sleep 1
+
+    ip addr flush dev "$IFACE" || true
+    ip link set "$IFACE" up || die "cannot bring $IFACE up"
+    ip addr add "$AP_ADDR" dev "$IFACE" || die "cannot set $AP_ADDR on $IFACE"
+
+    # dnsmasq BEFORE hostapd: the first device can associate the instant
+    # hostapd starts, and with no DHCP server yet it gets no address and gives
+    # up. Phones remember that failure and are slow to retry.
+    systemctl start dnsmasq || die "dnsmasq did not start"
+    systemctl start hostapd || die "hostapd did not start (journalctl -u hostapd)"
+
+    echo "camera-ap: access point up on $IFACE at ${AP_ADDR%/*}"
+    ;;
+
+off)
+    systemctl stop hostapd 2>/dev/null || true
+    systemctl stop dnsmasq 2>/dev/null || true
+    ip addr flush dev "$IFACE" || true
+
+    # Give wlan0 back to the client stack. dhcpcd re-reads /etc/dhcpcd.conf, so
+    # whatever wlan0 was configured to do before it became an access point is
+    # what it does again.
+    systemctl start wpa_supplicant 2>/dev/null || true
+    dhcpcd -n "$IFACE" >/dev/null 2>&1 || true
+
+    echo "camera-ap: access point down, $IFACE returned to the client stack"
+    ;;
+
+status)
+    if ap_running; then
+        state="on"
+    else
+        state="off"
+    fi
+    addr=$(ip -4 -br addr show "$IFACE" 2>/dev/null | awk '{print $3}' | cut -d/ -f1)
+    # The name people look for in their phone's WiFi list. Read from the live
+    # config rather than hard-coded here, so changing it in one place is enough.
+    ssid=$(awk -F= '/^ssid=/{print $2; exit}' /etc/hostapd/hostapd.conf 2>/dev/null)
+    # The passphrase, for the QR code the page offers when the network comes
+    # up: a phone joins by scanning instead of being read a long password out
+    # loud. Same file, same reason as the ssid above -- and readable here only
+    # because this script runs as root under sudo.
+    #
+    # It travels to the browser through /wifi_ap, which is administrators only.
+    # That is a deliberate trade for the QR, not an oversight.
+    psk=$(awk -F= '/^wpa_passphrase=/{print $2; exit}' /etc/hostapd/hostapd.conf 2>/dev/null)
+    # A passphrase may legitimately contain " or \, and either would produce
+    # JSON the page cannot parse -- the whole status would become unreadable
+    # over one password. Escaped here rather than hoped about.
+    psk=$(printf '%s' "$psk" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    clients=0
+    if [ "$state" = "on" ]; then
+        # One line per associated station.
+        #
+        # No `|| echo 0` here. With no stations `grep -c` ALREADY prints 0 --
+        # and exits 1 as well, because it matched nothing. The fallback then
+        # appended a second zero and the value became "0\n0", which is not
+        # valid JSON and made the whole status unreadable to the page. The
+        # ${clients:-0} below covers the only real failure, iw not running.
+        clients=$(iw dev "$IFACE" station dump 2>/dev/null | grep -c "^Station")
+    fi
+    printf '{"state":"%s","interface":"%s","address":"%s","ssid":"%s","passphrase":"%s","clients":%s}\n' \
+        "$state" "$IFACE" "${addr:-}" "${ssid:-}" "${psk:-}" "${clients:-0}"
+    ;;
+
+*)
+    die "usage: camera-ap {on|off|status}"
+    ;;
+esac

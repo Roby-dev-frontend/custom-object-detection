@@ -5,17 +5,16 @@ detection library any more: it sends frames over /detect_ws, the server
 detects, and when something is found a few pictures of it are kept here. Every
 page shows them in the strip in the corner of the video.
 
-A separate encrypted store, opened with the same passphrase as faces.db, for
-the reason objects.py gives: people are the one dataset here that cannot be
-regenerated, and nothing written in bulk by a camera should share a file with
-them.
+A separate SQLite store, so images written in bulk by a camera do not share
+a database with the custom-classifier references.
 
-Nothing is removed automatically. Somebody deletes an entry with its ✕, and
-the page warns everybody once there are more than 100.
+Entries can be deleted individually or cleared together, and the page warns
+everybody once there are more than 100.
 """
 
 import contextlib
 import json
+import logging
 import os
 import secrets
 import threading
@@ -24,6 +23,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import sqlite3
 
+logger = logging.getLogger(__name__)
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DETECTIONS_DB = os.path.join(_HERE, "detections.db")
 
@@ -31,11 +31,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS entry (
     id        TEXT    PRIMARY KEY,
     created   INTEGER NOT NULL,           -- milliseconds since the epoch
-    kind      TEXT    NOT NULL,           -- 'face', 'hand', 'object' or 'text'
+    kind      TEXT    NOT NULL,           -- current values: 'object' or 'text'
     label     TEXT    NOT NULL DEFAULT '',
-    -- Set for a face the server recognised; NULL for an unknown one and for
-    -- hands and objects. Not a foreign key: faces.db is another file.
-    person_id TEXT,
     device    TEXT    NOT NULL DEFAULT '',
     origin    TEXT,
     -- Which batch of three it came from, so the pictures of one moment can be
@@ -84,13 +81,11 @@ def _changed() -> None:
         _version += 1
 
 
-def connect(path: str = DETECTIONS_DB, create: bool = False,
-            passphrase: Optional[str] = None) -> sqlite3.Connection:
-    """Opens the store. `create` is False by default: a missing file must not
-    silently become an empty store."""
+def connect(path: str = DETECTIONS_DB, create: bool = False) -> sqlite3.Connection:
+    """Opens the detection store, creating it only when explicitly requested."""
     if not create and not os.path.exists(path):
         raise FileNotFoundError(
-            f"{path} does not exist. Refusing to create an empty encrypted store. "
+            f"{path} does not exist. Refusing to create an empty detection store. "
             "If this really is a first run, pass create=True."
         )
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=10.0)
@@ -102,6 +97,14 @@ def connect(path: str = DETECTIONS_DB, create: bool = False,
     columns = {row[1] for row in conn.execute("PRAGMA table_info(entry)")}
     if "origin" not in columns:
         conn.execute("ALTER TABLE entry ADD COLUMN origin TEXT")
+    # Older releases kept face photos in this same archive. Remove only those
+    # entries and their dependent metadata, preserving objects and OCR results.
+    face_ids = "SELECT id FROM entry WHERE kind = 'face'"
+    conn.execute(f"DELETE FROM entry_place WHERE id IN ({face_ids})")
+    conn.execute(f"DELETE FROM entry_text WHERE id IN ({face_ids})")
+    deleted = conn.execute("DELETE FROM entry WHERE kind = 'face'").rowcount
+    if deleted:
+        logger.info("removed %s legacy face detections from the saved strip", deleted)
     return conn
 
 
@@ -144,7 +147,6 @@ def _public(row: sqlite3.Row) -> Dict[str, Any]:
         "created": row["created"],
         "kind": row["kind"],
         "label": row["label"],
-        "person_id": row["person_id"],
         "device": row["device"],
         "origin": row["origin"] if "origin" in keys else None,
         "batch": row["batch"],
@@ -156,7 +158,7 @@ def _public(row: sqlite3.Row) -> Dict[str, Any]:
 
 
 _SELECT = (
-    "SELECT e.id, e.created, e.kind, e.label, e.person_id, e.device, e.origin, e.batch, e.boxes,"
+    "SELECT e.id, e.created, e.kind, e.label, e.device, e.origin, e.batch, e.boxes,"
     " p.lat, p.lon, p.accuracy, t.text FROM entry e"
     " LEFT JOIN entry_place p ON p.id = e.id"
     " LEFT JOIN entry_text t ON t.id = e.id"
@@ -164,15 +166,15 @@ _SELECT = (
 
 
 def add_entry(kind: str, label: str, jpeg: bytes, boxes: List[Any],
-              device: str = "", person_id: Optional[str] = None,
+              device: str = "",
               batch: str = "", position: Optional[Dict[str, Any]] = None,
               origin: Optional[str] = None) -> Dict[str, Any]:
     entry_id = secrets.token_hex(16)
     with _write() as conn:
         conn.execute(
-            "INSERT INTO entry (id, created, kind, label, person_id, device, origin, batch, jpeg, boxes)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (entry_id, int(time.time() * 1000), kind, label, person_id, device,
+            "INSERT INTO entry (id, created, kind, label, device, origin, batch, jpeg, boxes)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (entry_id, int(time.time() * 1000), kind, label, device,
              origin, batch, jpeg, json.dumps(boxes)),
         )
         if position:
@@ -198,8 +200,8 @@ def add_text_entry(text: str, mode: str, label: str, jpeg: bytes, boxes: List[An
     entry_id = secrets.token_hex(16)
     with _write() as conn:
         conn.execute(
-            "INSERT INTO entry (id, created, kind, label, person_id, device, origin, batch, jpeg, boxes)"
-            " VALUES (?, ?, 'text', ?, NULL, ?, ?, '', ?, ?)",
+            "INSERT INTO entry (id, created, kind, label, device, origin, batch, jpeg, boxes)"
+            " VALUES (?, ?, 'text', ?, ?, ?, '', ?, ?)",
             (entry_id, int(time.time() * 1000), label, device, origin, jpeg,
              json.dumps(boxes)),
         )
@@ -284,27 +286,6 @@ def entry_position(entry_id: str) -> Optional[Dict[str, Any]]:
             "SELECT lat, lon, accuracy FROM entry_place WHERE id = ?", (entry_id,)
         ).fetchone()
     return {"lat": row["lat"], "lon": row["lon"], "accuracy": row["accuracy"]} if row else None
-
-
-def unknown_faces() -> List[str]:
-    """Ids of the faces nobody was recognised in, oldest first."""
-    with _lock:
-        rows = _db().execute(
-            "SELECT id FROM entry WHERE kind = 'face' AND person_id IS NULL ORDER BY created"
-        ).fetchall()
-    return [row["id"] for row in rows]
-
-
-def update_label(entry_id: str, label: str, person_id: Optional[str]) -> bool:
-    """A face recognised after the fact, once somebody has been saved."""
-    with _write() as conn:
-        updated = conn.execute(
-            "UPDATE entry SET label = ?, person_id = ? WHERE id = ?",
-            (label, person_id, entry_id),
-        ).rowcount > 0
-    if updated:
-        _changed()
-    return updated
 
 
 def summary() -> Dict[str, Any]:

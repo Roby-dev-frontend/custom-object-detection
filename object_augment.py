@@ -17,8 +17,8 @@ be transformed too, and a box that is subtly wrong is worse than no extra
 photograph at all: the reference crop then holds a slice of background that the
 localiser learns to look for.
 
-Pure vision, like object_localisers.py: cv2 and numpy, no database, no
-passphrase. The caller reads the JPEG bytes, hands them here, and stores what
+Pure vision, like object_localisers.py: cv2 and numpy, no database. The caller
+reads the JPEG bytes, hands them here, and stores what
 comes back.
 
 WHAT THE FIVE ARE FOR

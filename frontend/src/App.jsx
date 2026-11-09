@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   AppShell,
   MantineProvider,
+  ActionIcon,
   Badge,
   Burger,
   Button,
@@ -29,22 +30,13 @@ import {
   Switch,
   Text,
   TextInput,
-  Title,
-  Tooltip,
   UnstyledButton,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { toast } from "sonner";
-// Mantine has no QR component and nothing else here can draw one. Used only to
-// turn a string into a PNG data URL; the dialog around it is Mantine's, and
-// the picture is shown with Mantine's own Image.
-import QRCode from "qrcode";
 import Login from "./Login";
-import { BrowserDetector } from "./detection/detector";
-import { drawDetections, drawFaces } from "./detection/draw";
-import { DetectionReporter } from "./detection/report";
+import { drawDetections } from "./detection/draw";
 import { clientId, deviceLabel } from "./detection/devices";
-import { FaceTracker, cropFaceToJpeg } from "./detection/faces";
 import {
   averagedFrameToJpeg,
   captureBurst,
@@ -53,11 +45,8 @@ import {
   frameToJpeg,
 } from "./detection/capture";
 import TextReadDialog from "./TextReader";
-import { detectionAt, pointerToCanvas } from "./detection/hittest";
+import { pointerToCanvas } from "./detection/hittest";
 import BoxPicker from "./BoxPicker";
-import FaceDetail from "./FaceDetail";
-import FaceEnrollModal from "./FaceEnrollModal";
-import FaceRecord from "./FaceRecord";
 import DetectionStrip, {
   SavedPictureModal,
   savedImageUrl,
@@ -81,21 +70,6 @@ function jsonHeaders() {
   return { "Content-Type": "application/json" };
 }
 
-async function sendCommand(command) {
-  try {
-    const response = await fetch(`${API_BASE}/command`, {
-      method: "POST",
-      headers: jsonHeaders(),
-      ...SEND_COOKIE,
-      body: JSON.stringify({ command }),
-    });
-    const data = await response.json();
-    console.log("Received:", data);
-  } catch (error) {
-    console.error("Request failed:", error);
-  }
-}
-
 function setServerSource(source, deviceIndex, detectionConfig, signal, shared) {
   return fetch(`${API_BASE}/source`, {
     method: "POST",
@@ -112,16 +86,7 @@ function setServerSource(source, deviceIndex, detectionConfig, signal, shared) {
   });
 }
 
-// Value used by the detection picker for hand detection; any other value
-// is a COCO class index (as a string, since option values are strings).
-// NOTE: only the labels are translated -- these values stay the original
-// indices, because that is what the backend and the model use.
-// Width the detector actually sees. The models resize their input anyway, and
-// the boxes are drawn a few pixels wide on a 640-wide display, so feeding them
-// a phone's native 1280x720 spent most of the frame budget on pixels nothing
-// used. The overlay canvas is sized to match, so the boxes come back in this
-// same coordinate space and CSS stretches them to the displayed size.
-const DETECT_WIDTH = 480;
+// Maximum width used to draw server-returned detections over the video.
 // Upper bound on how much larger than the detector's frame the overlay bitmap
 // may be. 3 x 640 covers a full-width 1920 px screen; past that the memory of
 // a bigger bitmap buys nothing the eye can see.
@@ -161,10 +126,8 @@ const MAX_SOCKET_BACKLOG = 72 * 1024;
 // shows up as a different frame rate at the far end. Anything finer would be a
 // control that appears to do nothing.
 //
-// The last rung is the only one that makes the picture SMALLER, and that is
-// deliberate: a watching page detects faces at 640 px and hands at 480 px and
-// never scales a picture up, so pixels taken away are taken from the detector,
-// while quality taken away is only compression.
+// The last rung is the only one that makes the picture smaller; the others
+// preserve its dimensions and reduce only compression quality.
 const VIDEO_RUNGS = [
   {
     value: "originale",
@@ -235,8 +198,6 @@ const TOAST_SOURCE = "source"; // switching camera source
 const TOAST_VIDEO = "video"; // the /video_ws stream we are watching
 const TOAST_SHARE = "share"; // this device publishing its own camera
 const TOAST_PRESENCE = "presence"; // the /presence heartbeat
-const TOAST_WIFI = "wifi"; // this machine's own WiFi access point
-const TOAST_FACES = "faces"; // enrolling and recognising people
 const TOAST_SAVED = "saved"; // the server found something (DetectionStrip)
 const TOAST_CLASSIFIER_ADD = "classifier-add"; // adding a strip picture as a training view
 const TOAST_TEMPLATE_PICKS = "template-picks"; // choosing template's references
@@ -308,15 +269,7 @@ const VARIANT_LABELS = {
   colour: "colore",
 };
 
-const HAND_OPTION = "hand";
-const HAND_LABEL = "Mani (MediaPipe)";
-
-const FACE_OPTION = "face";
-const FACE_LABEL = "Volti";
-
-// A classifier's picker value is this prefix plus its id, e.g. "obj:abc123" --
-// object ids are 32 hex characters, so this can never collide with a YOLO
-// class index (the picker's other kind of non-face/non-hand value).
+// A classifier's picker value is this prefix plus its id, e.g. "obj:abc123".
 const CLASSIFIER_PREFIX = "obj:";
 function isClassifierChoice(value) {
   return typeof value === "string" && value.startsWith(CLASSIFIER_PREFIX);
@@ -324,13 +277,6 @@ function isClassifierChoice(value) {
 function classifierIdFromChoice(value) {
   return value.slice(CLASSIFIER_PREFIX.length);
 }
-
-// Faces get a bigger canvas than hands and objects. Detection cost does not
-// change -- BlazeFace resizes whatever it is given to 128x128 -- but the
-// detector is run on 3x3 tiles to reach across a room, and at 480 each tile is
-// only 160 px wide. The extra pixels cost one larger drawImage per frame and
-// buy detail in every tile.
-const FACE_DETECT_WIDTH = 640;
 
 // Frames kept per press of "Cattura". Ten is the server's own cap on one
 // request (MAX_CAPTURE_IMAGES), and at the 400 ms spacing captureBurst uses it
@@ -397,72 +343,6 @@ const GUIDED_STEPS = [
 const IMPORT_BATCH = 10;
 const IMPORT_GAP_MS = 2000;
 
-// How often a face that is already identified is checked again. A cached
-// identity is a hypothesis with a shelf life, not a fact: the person in the box
-// can be replaced by someone else while the tracker thinks it is still the same
-// box.
-const FACE_REVERIFY_MS = 6000;
-// How soon to try again on a face we could not identify. Shorter, because an
-// unknown face is the one the user is probably waiting on -- and because a
-// second answer is no use once the track it belongs to has expired, which
-// happens a second after the box breaks.
-const FACE_RETRY_MS = 1500;
-// A name is shown once the same person has been named FACE_CONFIRMATIONS times
-// within the last FACE_VOTE_WINDOW answers.
-//
-// NOT "twice in a row", which is what this was first written as and which does
-// not work: when a record is thin the score sits near the threshold and the
-// answers alternate between the right name and "uncertain", so two consecutive
-// agreements never happen and the box stays blank for ever. Two out of three
-// tolerates that flicker while still requiring real agreement -- to show a
-// WRONG name it would have to be the same wrong person twice in three tries.
-const FACE_CONFIRMATIONS = 2;
-const FACE_VOTE_WINDOW = 3;
-// ...except when one answer is decisive on its own, which names the person
-// immediately.
-//
-// Waiting for a second opinion assumes the face will still be there to have
-// one about. It often is not: tracks expire a second after the box breaks, and
-// a new track starts with no votes, so with a phone in the hand or a face on a
-// television the second vote never arrives and NOBODY is ever named. Measured
-// on the real store, leave-one-out over every stored sample: correct matches
-// scored 0.451-0.989 with the runner-up never above 0.280, and no probe
-// matched the wrong person at all. An answer this far clear of second place is
-// not the kind that needs confirming.
-const FACE_STRONG_SCORE = 0.55;
-const FACE_STRONG_MARGIN = 0.15;
-// How long the panel under the video keeps showing a face after the detector
-// last saw it. Without this a single missed frame empties the panel, and the
-// "save this face" button disappears from under the user's finger.
-const FACE_SELECTION_GRACE_MS = 2000;
-// Crops kept per face, and for how long, so that saving uses the moment you
-// were looking at when you pressed the button rather than two seconds later.
-const CROP_BUFFER_SIZE = 6;
-const CROP_BUFFER_MS = 8000;
-// ...but ENROLLING from a crop that old is a different matter. Eight seconds
-// is long enough to have walked several metres, and a burst mixing a face from
-// then with the face now is a burst the server cannot store: the frames
-// disagree with each other, and the oldest are below the size floor even when
-// the one on screen is not. Both of those were reported as bugs; this is the
-// line they came from.
-const ENROL_CROP_MAX_AGE_MS = 3000;
-
-/** What the panel under the video actually shows about a face, as a string.
- *
- * Used to skip a re-render when the new detection says the same thing as the
- * old one: the box moves every frame, and none of that movement changes a
- * single word beneath it. */
-function panelSignature(detection) {
-  if (!detection) return "";
-  const identity = detection.identity;
-  return [
-    detection.trackId,
-    identity?.status ?? "",
-    identity?.person?.id ?? identity?.maybe?.id ?? "",
-    identity?.score ?? "",
-  ].join("|");
-}
-
 // Builds a ws:// or wss:// URL. API_BASE is empty in the production build
 // (relative URLs), so fall back to the address the page was loaded from --
 // that also picks wss:// automatically when the page is served over https.
@@ -471,79 +351,71 @@ function websocketUrl(path) {
   return base.replace(/^http/, "ws") + path;
 }
 
-// FastAPI's `detail` is a string for most errors here, but the duplicate-face
-// refusal sends an object so the page can offer to add the view to the person
-// it names. This reads either.
 function detailText(detail) {
   if (!detail) return null;
   if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) => {
+        const location = Array.isArray(item.loc) ? item.loc.join(".") : "";
+        return [location, item.msg].filter(Boolean).join(": ");
+      })
+      .filter(Boolean)
+      .join("; ");
+  }
   return detail.message ?? null;
 }
 
-function detectionConfigFor(selectValue, location, numHands = "1") {
-  let backend;
-  if (selectValue === FACE_OPTION) {
-    backend = { backend: "face", yolo_classes: null, object_id: null };
-  } else if (selectValue === HAND_OPTION) {
-    backend = { backend: "mediapipe", yolo_classes: null, object_id: null };
-  } else if (isClassifierChoice(selectValue)) {
-    backend = {
-      backend: "classifier",
-      yolo_classes: null,
-      object_id: classifierIdFromChoice(selectValue),
-    };
-  } else {
-    backend = {
-      backend: "yolo",
-      yolo_classes: [Number(selectValue)],
-      object_id: null,
-    };
+function detectionConfigFor(selectValue) {
+  if (!isClassifierChoice(selectValue)) {
+    return { backend: null, object_id: null };
   }
-  // `location` tells the server whether to annotate at all. "browser" makes it
-  // publish raw frames and leaves the drawing to us; see DETECTION_CONFIG in
-  // detection.py. Faces are always "browser": the server has no face detector,
-  // so "server" would mean no faces found anywhere. Classifiers are the
-  // opposite -- always "server": the method needs server-side MediaPipe
-  // tasks, and there is no browser implementation to fall back to.
-  //
-  // num_hands is always stated too. It only matters to the server while hands
-  // are detected THERE, but leaving it out would leave whatever some other page
-  // last sent.
   return {
-    ...backend,
-    location:
-      backend.backend === "face"
-        ? "browser"
-        : backend.backend === "classifier"
-          ? "server"
-          : location,
-    num_hands: Number(numHands) === 2 ? 2 : 1,
+    backend: "classifier",
+    object_id: classifierIdFromChoice(selectValue),
   };
 }
 
-// The inverse: turns the server's detection_config back into the picker's
-// value, so a page can follow a choice made on another device. Returns null
-// when the config has no single option to point at -- "yolo with every class"
-// is a valid server state the picker cannot represent.
+function cameraConstraints(deviceId) {
+  return {
+    video: {
+      ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: "environment" }),
+      width: { ideal: 1280 },
+    },
+  };
+}
+
+function InfoControl({ text, onOpen, children, className = "" }) {
+  return (
+    <div className={`relative inline-flex ${className}`}>
+      {children}
+      <ActionIcon
+        type="button"
+        size={22}
+        radius="xl"
+        variant="filled"
+        aria-label="Informazioni"
+        aria-haspopup="dialog"
+        onClick={(event) => {
+          event.stopPropagation();
+          onOpen(text);
+        }}
+        className="absolute -right-2 -top-2 z-20 !border !border-[#242424] !bg-[#f5f5f5] !text-[#242424] shadow-sm"
+      >
+        <span aria-hidden="true" className="text-xs font-extrabold">
+          i
+        </span>
+      </ActionIcon>
+    </div>
+  );
+}
+
 function choiceFromConfig(config) {
   if (!config) return null;
-  if (config.backend === "face") return FACE_OPTION;
-  if (config.backend === "mediapipe") return HAND_OPTION;
   if (config.backend === "classifier") {
     return config.object_id ? CLASSIFIER_PREFIX + config.object_id : null;
   }
-  const first = config.yolo_classes?.[0];
-  return first === undefined || first === null ? null : String(first);
-}
-
-// Reports what we detected so the Pi can still act on it (GPIO etc.).
-function postDetections(body) {
-  return fetch(`${API_BASE}/detections`, {
-    method: "POST",
-    headers: jsonHeaders(),
-    ...SEND_COOKIE,
-    body: JSON.stringify(body),
-  });
+  return null;
 }
 
 /**
@@ -737,17 +609,19 @@ function ObjectViewThumb({
   );
 }
 
-function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurrent, setRekeyNew, setRekeyConfirm }) {
+function CameraApp({ account, onLoggedOut }) {
   const [source, setSource] = useState("usb");
   // Whichever USB index is actually active on the backend right now
   // (0 = "This device's webcam", anything else = "USB Webcam").
   const [activeIndex, setActiveIndex] = useState(null);
   const [usbDevices, setUsbDevices] = useState(null); // null = never scanned yet
-  // Whether a real Pi Camera Module is attached. Starts true so the button is
-  // not hidden and then popped back in during the first scan; the scan below
-  // corrects it within a second of load.
-  const [hasPiCamera, setHasPiCamera] = useState(true);
+  // Whether a real Pi Camera Module is attached. Unknown until the first scan.
+  const [hasPiCamera, setHasPiCamera] = useState(false);
   const [scanning, setScanning] = useState(false);
+  const [localVideoDevices, setLocalVideoDevices] = useState([]);
+  const [selectedLocalDeviceId, setSelectedLocalDeviceId] = useState("");
+  const [localDeviceScanning, setLocalDeviceScanning] = useState(false);
+  const [localDeviceScanComplete, setLocalDeviceScanComplete] = useState(false);
   // Gathering photographs of an object, for the measurement that decides
   // whether custom-object detection is worth building. Open to every operator
   // on purpose: one database, many people, each contributing the angle they
@@ -826,34 +700,12 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   // selectSource() below resolves, so the spinner must be up from first
   // paint.
   const [switching, setSwitching] = useState(true);
-  // COCO class index -> italian name, fetched from the backend so the labels
-  // always match the indices it filters on. FOR DISPLAY ONLY.
-  const [cocoClasses, setCocoClasses] = useState({});
-  // The same indices -> the ENGLISH names, which is what the models actually
-  // report. These two were one map once, holding the Italian names, and the
-  // browser then filtered MediaPipe's detections by comparing its English
-  // "scissors" against our "forbici" -- so every one of the eighty classes
-  // matched nothing and detected nothing. Two maps, because the label a person
-  // reads and the label a model emits are different things.
-  const [cocoNames, setCocoNames] = useState({});
-  // Only what the picker shows for the instant before the first heartbeat
-  // answers -- the real default lives in DETECTION_CONFIG on the server. Kept
-  // in step with it so the field does not flicker from one class to another on
-  // every load.
-  const [detectionChoice, setDetectionChoice] = useState(FACE_OPTION);
-  // How many hands the hand detector follows on THIS device: "1" or "2", as
-  // the Select hands it back. One is the default because allowing two while
-  // one is in view makes every frame cost about twice as much -- see
-  // setHandCount in detection-worker.js.
-  const [handCount, setHandCount] = useState("1");
-  // TEMPORARY: medians shown by the diagnostic readout -- see recordTiming.
-  const [detectTiming, setDetectTiming] = useState(null);
-  // TEMPORARY: video frames received per second -- see fpsTimer.
+  const [detectionChoice, setDetectionChoice] = useState(null);
   const [videoFps, setVideoFps] = useState(null);
   // What the server found in own-camera devices' frames: the strip in the
   // corner (DetectionStrip), newest first, the same on every page.
   const [savedEntries, setSavedEntries] = useState([]);
-  // The hand/object picture opened bigger, or null.
+  // Which saved picture opened bigger, or null.
   const [enlargedEntry, setEnlargedEntry] = useState(null);
   // Reading text from a frame. `readImage` is the frozen frame the dialog
   // shows and the one a save sends back, so what is saved is what was read.
@@ -875,22 +727,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   const [readError, setReadError] = useState(null);
   const [readBusy, setReadBusy] = useState(false);
   const [readSaving, setReadSaving] = useState(false);
-  // Between the press and the frozen frame: the 8 frames being taken.
-  // The face picture (base64) the save/edit form was opened from, when it was
-  // opened from the strip; null when opened from the live video. It is what
-  // the form's extra buttons add to a person.
-  const [stripFaceImage, setStripFaceImage] = useState(null);
-  // The same picture, for the "Aggiungi a una persona…" dialog: null when that
-  // dialog was opened from the live video's face panel.
-  const pickImagesRef = useRef(null);
-  // The strip entry the form was opened from. Once its picture has been saved
-  // -- as a new person or added to one -- it leaves the strip; the person
-  // keeps the picture in faces.db.
-  const stripEntryRef = useRef(null);
-  // Person ids a list of people was already asked for, so a name in the strip
-  // with no colour yet (saved on another device) triggers one reload, not one
-  // per render.
-  const peopleAskedRef = useRef(new Set());
+  const [infoMessage, setInfoMessage] = useState(null);
   // Ids already shown, so only NEW ones raise a toast. null until the first
   // load: whatever is there when the page opens is not news.
   const seenSavedRef = useRef(null);
@@ -959,8 +796,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   const [cameraShared, setCameraShared] = useState(true);
   // What the server says about the Pi's webcam detecting at all.
   const [serverActive, setServerActive] = useState(true);
-  // The Pi's camera is on, whether or not it is shown to this page.
-  const [piCameraOn, setPiCameraOn] = useState(false);
   const detectPendingRef = useRef(null);
   const [sharePending, setSharePending] = useState(false);
   const [watchPending, setWatchPending] = useState(false);
@@ -969,38 +804,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   // sharing upload hands it each frame it sends, so detection does not encode
   // a second copy of the same picture on the phone.
   const shareFrameSinkRef = useRef(null);
-  // The text inside the Detect field. Held here rather than left to Mantine
-  // because clicking the field must EMPTY it (so you can type a class name
-  // straight away instead of deleting the old one first), and closing it
-  // without choosing anything must put the old name back.
-  const [detectionSearch, setDetectionSearch] = useState(FACE_LABEL);
-  // This machine's own WiFi access point, so phones can reach the app with no
-  // router and no internet. null until the server has been asked; administrators
-  // only, and the server enforces that regardless of what is rendered here.
-  const [accessPoint, setAccessPoint] = useState(null);
-  const [accessPointBusy, setAccessPointBusy] = useState(false);
-  const [confirmApOff, setConfirmApOff] = useState(false);
-  // Its mirror image: nothing happens until this one is answered either.
-  const [confirmApOn, setConfirmApOn] = useState(false);
-  // Shown once the network is actually up: the name, the address, and a QR a
-  // phone can scan to join instead of being read the password out loud.
-  // The data URL, not the payload -- generating it is asynchronous, so the
-  // dialog opens on the picture being ready rather than on a promise.
-  const [joinQr, setJoinQr] = useState(null);
-  // Where detection runs. "browser" is the default because the Pi 4 spends
-  // 167-548 ms a frame on it and the viewing device usually spends far less.
-  // "server" is chosen with "Dove rilevare", for hands and objects: a Windows
-  // PC serving the app measured 44 ms a hand detection against a phone's 120.
-  //
-  // locationChoice is what was picked; detectionLocation is what actually
-  // applies, and faces are always "browser" because the server has no face
-  // detector. It is also adopted from every page's heartbeat: with "server"
-  // the server draws the marks into the one shared stream, and a page still
-  // detecting on its own would draw a second set on top -- the reason the
-  // original toggle was taken out.
-  // detectionLocation itself is worked out further down, next to
-  // capturesOwnCamera, which it depends on.
-  const [locationChoice, setLocationChoice] = useState("browser");
   // Whether this device's camera is uploaded to the server for OTHER devices
   // to watch. Off by default: with detection running here, the upload serves
   // nobody but other viewers, and it is the largest cost on a phone -- JPEG
@@ -1011,10 +814,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   //
   //   "contain" -- the whole frame is shown and two bands are left. Nothing at
   //                the edge of the camera's view is ever lost.
-  //   "cover"   -- the stage is filled and the overflow is cropped. On a 390 px
-  //                phone with a 4:3 camera that discards about 65% of the
-  //                WIDTH, and a face in the discarded part is neither visible
-  //                nor tappable.
+  //   "cover"   -- the stage is filled and the overflow is cropped.
   //
   // A per-device choice, not a server setting: it is about the shape of THIS
   // screen. localStorage can throw (private mode, blocked site data), so every
@@ -1195,12 +995,8 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     withinPortal: true,
     portalProps: { target: dropdownHost ?? undefined },
   };
-  // Progress of the model download/initialisation: "" once ready.
-  const [detectorStatus, setDetectorStatus] = useState("");
   // Live objects rather than state: these change every frame and must not
   // re-render React.
-  const detectorRef = useRef(null);
-  const reporterRef = useRef(null);
   const videoImgRef = useRef(null); // <img> fed one frame at a time by /video_ws
   const overlayRef = useRef(null); // <canvas> we draw the result on
   const remoteVideoRef = useRef(null); // this device's own camera, when remote
@@ -1211,41 +1007,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   const switchingRef = useRef(true);
   switchingRef.current = switching;
 
-  // --- Faces -----------------------------------------------------------
-  //
-  // The detection loop runs on requestAnimationFrame, so nothing in it may
-  // touch React state: setState at 30 Hz re-renders the whole page and is the
-  // quickest way to ruin the frame rate here. The loop writes to refs, and a
-  // slow interval below copies across the little the interface actually needs.
-  const trackerRef = useRef(null);
-  if (trackerRef.current === null) trackerRef.current = new FaceTracker();
-  const faceDetectionsRef = useRef([]);
-  const faceDetectWidthRef = useRef(0);
-  const selectedTrackRef = useRef(null);
-  // The burst captured when the enrol dialog opened. Held in a ref rather than
-  // state because it is several JPEGs and nothing renders it except the first.
-  const enrollImagesRef = useRef([]);
-  // Per-track bookkeeping for the automatic recogniser: when we last asked
-  // about this face, and what the last few answers were.
-  const recogMetaRef = useRef(new Map());
-  // Recent crops per track, so "Salva questo volto" can use frames from BEFORE
-  // the button was pressed.
-  const cropBufferRef = useRef(new Map());
-  const recogniseBusyRef = useRef(false);
-  // When the selected face was last actually on screen, for the grace period
-  // that keeps the panel from flickering away on a missed frame.
-  const lastSeenRef = useRef(0);
-
-  const [faceJudges, setFaceJudges] = useState(null);
-  const [defaultJudge, setDefaultJudge] = useState("accettabile");
-  const [selectedTrack, setSelectedTrack] = useState(null);
-  const [selectedFace, setSelectedFace] = useState(null);
-  const [faceCount, setFaceCount] = useState(0);
-  const [enrollOpen, setEnrollOpen] = useState(false);
-  const [enrollPreview, setEnrollPreview] = useState(null);
-  const [enrollPerson, setEnrollPerson] = useState(null);
-  const [savingFace, setSavingFace] = useState(false);
-  const [addingView, setAddingView] = useState(false);
   // The strip entry whose "Aggiungi al classificatore" is mid-request, so
   // only its own button shows a spinner.
   const [addingToClassifier, setAddingToClassifier] = useState(null);
@@ -1255,31 +1016,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   // had, which does not learn about the new photo on its own. The name is
   // the classifier's, for the message.
   const [misuraHint, setMisuraHint] = useState(null);
-  // The record pinned on screen by "Dettagli", as it was when the button was
-  // pressed. It is only ever the starting point: see pinnedPerson below.
-  const [pinnedSnapshot, setPinnedSnapshot] = useState(null);
-  const [people, setPeople] = useState([]);
-  // The "add this face to somebody already saved" picker. It exists for the
-  // case a thin record cannot be recognised at all -- without it, the only
-  // record that needs a new view is the one you cannot reach.
-  const [pickOpen, setPickOpen] = useState(false);
-  const [pickValue, setPickValue] = useState(null);
-  // Defaults mirror face_embedding.py; the server overwrites both on load so
-  // the two cannot drift apart.
-  const [enrolMinFacePx, setEnrolMinFacePx] = useState(40);
-  const minFacePxRef = useRef(29);
-
-  selectedTrackRef.current = selectedTrack;
-  // The pinned record, taken from the list loadFaces() keeps up to date rather
-  // than from the snapshot: adding a view or editing the description while the
-  // panel is open would otherwise leave it showing what was true when it was
-  // opened. The snapshot is the fallback, for the moment between saving a new
-  // person and the list coming back.
-  const pinnedPerson = pinnedSnapshot
-    ? (people.find((person) => person.id === pinnedSnapshot.id) ??
-      pinnedSnapshot)
-    : null;
-  const faceMode = detectionChoice === FACE_OPTION;
   // Whether the first heartbeat has answered yet. Until it has, this page
   // knows nothing about which camera the server is on.
   const firstBeat = useRef(true);
@@ -1350,17 +1086,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   const showVideo =
     pageVisible &&
     (importedVideo || localCameraPreview || !serverVideoSuppressed);
-  // What actually applies, from locationChoice. Always "browser" for faces (the
-  // server has no face detector) and whenever this page shows its OWN camera:
-  // that picture goes from the lens straight to this screen, so boxes drawn by
-  // the server could only ever land in the copy other devices watch. Choosing
-  // "server" there used to switch detection off here and show it nowhere.
-  const detectionLocation =
-    detectionChoice === FACE_OPTION || capturesOwnCamera
-      ? "browser"
-      : isClassifierChoice(detectionChoice)
-        ? "server"
-        : locationChoice;
   // Detect only where the pixels are first-hand: on your own camera, or on the
   // Pi's stream when nobody is sharing. Detecting on someone else's shared
   // feed put boxes on a picture meant to be raw, drew them with the MJPEG
@@ -1368,30 +1093,19 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   // CPU the browser needed to keep up with that stream in the first place.
   // While a device shares, detection belongs to that device alone.
   //
-  // Never on this page's OWN camera any more: such a page runs no detection
-  // library at all -- it sends frames to /detect_ws and the server detects
-  // (see the upload effect below and DetectionStrip). On a phone the in-browser
-  // hand model took ~120 ms a pass and the live view lagged behind it.
-  // On the Raspberry's own webcam, nothing is detected until Osserva or Avvia is
-  // pressed -- the same as on a phone's camera.
+  // This page sends frames to /detect_ws for server-side classification.
+  // Nothing is detected until Osserva or Avvia is pressed.
   const observing = detectOn || detectOnlyOn;
   // A picture exists to be read unless the camera is off. This device's own
   // camera shows its picture without being shared.
   const cameraOn = source !== "none" || importedVideo || localCameraPreview;
   const observingRef = useRef(false);
   observingRef.current = observing;
-  const detectsHere =
-    !localCameraPreview &&
-    !someoneElseShares &&
-    source !== "remote" &&
-    source !== "none" &&
-    (!serverCamera || observing);
   // What the spinner over the video says, when something asked for is not
   // working yet (see detectPending). A model that failed to load is not
   // waiting for anything: that message stays in the top bar only.
   const busyText =
     (textOn && textReading ? "Lettura in corso..." : "") ||
-    (detectorStatus.startsWith("Caricamento") ? detectorStatus : "") ||
     detectPending?.text ||
     (sharePending ? "Avvio condivisione…" : "") ||
     (watchPending ? "In attesa del video…" : "");
@@ -1405,6 +1119,10 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   const loadingLabel =
     busyText || (waitingForDetection ? "Caricamento del rilevamento..." : "");
   const spinnerVisible = switching || scanning || Boolean(loadingLabel);
+  const cameraDiscoveryPending =
+    clientIsServer
+      ? scanning || usbDevices === null
+      : localDeviceScanning || !localDeviceScanComplete;
 
   // True while this page has something to measure: it is either the one
   // sending the video or one of the ones watching it.
@@ -1588,22 +1306,8 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     };
   }, [inShare]);
 
-  // [{ value, label }] -- faces first, then hands, then every COCO class in
-  // ITALIAN alphabetical order. Faces lead the list because that is the one
-  // this app is now built around; the two named options stay out of the
-  // alphabetical run so they do not have to be hunted for among eighty.
-  //
-  // The server hands these back keyed by COCO index, so they arrived in the
-  // model's own order: persona, bicicletta, automobile, motocicletta,
-  // aeroplano... Nothing about that order is visible to someone reading the
-  // list, which made finding a class a matter of scrolling through all eighty.
-  //
-  // localeCompare with "it" rather than a plain `<`: that sorts by character
-  // code, which puts every capital before every lower-case letter ("TV" above
-  // "aeroplano") and misfiles accented letters. Only `label` is reordered --
-  // `value` stays the COCO index the server filters on.
-  // One per classifier, grouped apart from the COCO run below. Disabled
-  // (and marked as such) until it has an active measurement -- it can be
+  // One option per custom classifier. Disabled until it has an active
+  // measurement -- it can be
   // SEEN as soon as it exists, so its absence never reads as a bug, but it
   // cannot be picked until Misura has found a method that works and an
   // administrator has activated it.
@@ -1613,53 +1317,25 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     disabled: !item.detector,
   }));
 
-  const detectionOptions = [
-    { value: FACE_OPTION, label: FACE_LABEL },
-    { value: HAND_OPTION, label: HAND_LABEL },
-    ...(classifierOptions.length
-      ? [{ group: "Classificatori personalizzati", items: classifierOptions }]
-      : []),
-    ...Object.entries(cocoClasses)
-      .map(([index, label]) => ({ value: index, label }))
-      .sort((a, b) => a.label.localeCompare(b.label, "it")),
-  ];
-  // Grouped entries (the classifiers above) nest inside one item's `items`,
-  // so a plain .find over detectionOptions cannot see them -- flatten once
-  // for every lookup that needs to find an option by value.
-  const flatDetectionOptions = detectionOptions.flatMap((o) => o.items ?? [o]);
+  const detectionOptions = classifierOptions;
   // What the field shows when you are NOT searching in it.
   const currentDetectionLabel =
-    flatDetectionOptions.find((o) => o.value === detectionChoice)?.label ?? "";
-
-  // Whenever the selected class really changes -- picked here, picked on
-  // another device and carried over by the heartbeat, or the COCO names
-  // arriving from the server and giving the current index a label -- the field
-  // shows the new name. This also corrects the restore below in the one case
-  // where it guesses wrong: closing the dropdown BY choosing something runs
-  // that handler with the previous choice still in state, and this effect
-  // immediately overwrites it with the right one.
-  useEffect(() => {
-    setDetectionSearch(currentDetectionLabel);
-  }, [currentDetectionLabel]);
+    detectionOptions.find((o) => o.value === detectionChoice)?.label ?? "";
 
   /** A webcam button turns that camera on or off -- it does NOT share it. On:
    *  the picture shows on the server machine's pages only, until
    *  « Condividi la webcam » is pressed. Clicking the one that is running turns
    *  it off; clicking another while one is on switches to it, keeping whether
    *  it is shared. */
-  function pickWebcam(nextSource, index) {
-    // On a phone the panel covers the picture this click is about to change.
-    if (!clientIsServer && wideScreen !== true) setPiOpen(false);
-    setChosenWebcam({ source: nextSource, index });
+   function pickWebcam(nextSource, index) {
+     setAppOpen(false);
     const running =
       webcamOn &&
       source === nextSource &&
       (nextSource !== "usb" || activeIndex === index);
-    if (running) {
-      selectSource("none");
-      return;
-    }
-    selectSource(nextSource, index, undefined, webcamOn ? cameraShared : true);
+    if (running) return;
+    setChosenWebcam({ source: nextSource, index });
+    selectSource(nextSource, index, undefined, webcamOn ? cameraShared : false);
   }
 
   /** "Condividi la webcam" / "Smetti di condividere", like the client's button:
@@ -1689,7 +1365,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
       // earlier choice cannot stay behind.
       const config = {
         ...(detectionConfig ??
-          detectionConfigFor(detectionChoice, detectionLocation, handCount)),
+          detectionConfigFor(detectionChoice)),
         active:
           next === "usb" || next === "picamera" ? observingRef.current : true,
       };
@@ -1714,6 +1390,12 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         clearTimeout(timer);
       }
       const data = await response.json();
+      if (!response.ok) {
+        throw new Error(
+          detailText(data.detail) ??
+            `Cambio videocamera non riuscito (${response.status}).`,
+        );
+      }
       // The server reports whether this page is running on the server machine.
       setClientIsServer(Boolean(data.client_is_server));
       if (typeof data.shared === "boolean") setCameraShared(data.shared);
@@ -1746,15 +1428,17 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         // put up last time.
         toast.dismiss(TOAST_SOURCE);
       }
+      return true;
     } catch (error) {
       console.error("Failed to switch camera source:", error);
       toast.error(
         error.name === "AbortError"
           ? `Il server non ha risposto entro ${SOURCE_TIMEOUT_MS / 1000} secondi. ` +
               "La videocamera scelta potrebbe non rispondere: provane un'altra."
-          : "Impossibile contattare il server.",
+          : error.message || "Impossibile contattare il server.",
         { id: TOAST_SOURCE },
       );
+      return false;
     } finally {
       // Always re-enabled, whatever went wrong: leaving this true is what made
       // the interface look permanently frozen.
@@ -1766,69 +1450,23 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   // current source/index and only varies detection_config.
   function selectDetection(selectValue) {
     setDetectionChoice(selectValue);
-    if (detectOn || detectOnlyOn) setDetectionReady(false);
-    // On this device's own camera the server detects: the new kind is working
-    // when its first answer comes back (objects took ~20 s the first time,
-    // while the server loaded the model). Only worth waiting for if either
-    // button actually has frames streaming right now.
-    if (
-      (capturesOwnCamera || importedVideo || localCameraPreview) &&
-      (detectOn || detectOnlyOn)
-    ) {
+    setDetectionReady(false);
+    if (!isClassifierChoice(selectValue)) {
+      setDetectOn(false);
+      setDetectOnlyOn(false);
+    } else if (canDetect && !textMode && !detectOn) {
+      setDetectOnlyOn(true);
+    }
+    if (isClassifierChoice(selectValue) && (detectOn || detectOnlyOn)) {
       detectPendingRef.current = {
-        text: "Cambio rilevamento…",
-        backend: detectionConfigFor(
-          selectValue,
-          capturesOwnCamera ? "browser" : detectionLocation,
-          handCount,
-        ).backend,
+        text: "Cambio rilevamento?",
+        backend: "classifier",
       };
       setDetectPending(detectPendingRef.current);
     }
-    // Same reason the panel hides during a capture: whatever is picked here,
-    // it is picked to see it find something right away, and on a phone this
-    // panel (where the picker itself lives) is what is covering the video.
-    // Every option, not just classifiers and YOLO classes: face and hand had
-    // been left out, and that was the bug.
     setPiOpen(false);
     setAppOpen(false);
-    selectSource(
-      source,
-      activeIndex ?? undefined,
-      detectionConfigFor(
-        selectValue,
-        capturesOwnCamera ? "browser" : locationChoice,
-        handCount,
-      ),
-    );
-  }
-
-  // "Dove rilevare". Stated to the server at once: detection_config is shared,
-  // and with "server" it is the server that draws the marks into the one
-  // stream every device watches.
-  function changeLocation(value) {
-    setLocationChoice(value);
-    selectSource(
-      source,
-      activeIndex ?? undefined,
-      detectionConfigFor(detectionChoice, value, handCount),
-    );
-  }
-
-  // "Mani da rilevare". Detecting here, the count only reaches this page's own
-  // worker (it travels with each frame); detecting on the server, the server's
-  // detector is the one that has to change, so it is sent there as well.
-  function changeHandCount(value) {
-    setHandCount(value);
-    // On this page's own camera the server detects too (/detect_ws), with the
-    // shared config, so the count has to reach it there as well.
-    if (detectionLocation === "server" || capturesOwnCamera) {
-      selectSource(
-        source,
-        activeIndex ?? undefined,
-        detectionConfigFor(detectionChoice, detectionLocation, value),
-      );
-    }
+    selectSource(source, activeIndex ?? undefined, detectionConfigFor(selectValue));
   }
 
   function importVideoFile(file) {
@@ -1847,7 +1485,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
       setTextOn(true);
       setTextSave(false);
     } else {
-      setDetectOnlyOn(true);
+      setDetectOnlyOn(isClassifierChoice(detectionChoice));
       setTextOn(false);
     }
     setImportedVideoUrl(url);
@@ -1920,9 +1558,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     let cancelled = false;
     let stream = null;
     navigator.mediaDevices
-      .getUserMedia({
-        video: { facingMode: "environment", width: { ideal: 1280 } },
-      })
+      .getUserMedia(cameraConstraints(selectedLocalDeviceId))
       .then(async (openedStream) => {
         if (cancelled) {
           openedStream.getTracks().forEach((track) => track.stop());
@@ -1930,7 +1566,16 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         }
         stream = openedStream;
         video.srcObject = openedStream;
-        await video.play();
+        const activeDeviceId =
+          openedStream.getVideoTracks()[0]?.getSettings().deviceId;
+        if (activeDeviceId) setSelectedLocalDeviceId(activeDeviceId);
+        try {
+          await video.play();
+        } catch (error) {
+          if (cancelled) return;
+          if (error.name !== "AbortError") throw error;
+        }
+        void scanLocalVideoDevices();
       })
       .catch((error) => {
         if (cancelled) return;
@@ -1943,7 +1588,12 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
       stream?.getTracks().forEach((track) => track.stop());
       if (video.srcObject === stream) video.srcObject = null;
     };
-  }, [localCameraPreview, capturesOwnCamera, pageVisible]);
+  }, [
+    localCameraPreview,
+    capturesOwnCamera,
+    pageVisible,
+    selectedLocalDeviceId,
+  ]);
 
   // Ends whoever is sharing, from here. Without it a spectator is stuck
   // watching a camera it did not start and cannot turn off.
@@ -1966,116 +1616,13 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     }
   }
 
-  // --- this machine's own WiFi network ---------------------------------
-
-  // Asked once, and only for an administrator: a non-admin gets 403 from this
-  // address, and a 403 in the console on every page load looks like a fault.
-  useEffect(() => {
-    if (!account.is_admin) return;
-    let cancelled = false;
-    fetch(`${API_BASE}/wifi_ap`, SEND_COOKIE)
-      .then((response) => (response.ok ? response.json() : null))
-      .then((data) => {
-        if (!cancelled && data) setAccessPoint(data);
-      })
-      .catch(() => {
-        // Silent on purpose. The heartbeat already reports a server that
-        // cannot be reached; saying it twice helps nobody.
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [account.is_admin]);
-
-  // The WIFI: payload phones understand, with the four characters that carry
-  // meaning inside it escaped. A passphrase containing a ; or a , would
-  // otherwise end the field early and the phone would silently try to join
-  // with half a password -- the failure would look like a wrong password
-  // rather than like a bad QR.
-  function wifiPayload(ssid, passphrase) {
-    const escape = (value) => String(value).replace(/([\\;,:"])/g, "\\$1");
-    return `WIFI:T:WPA;S:${escape(ssid)};P:${escape(passphrase)};H:false;;`;
-  }
-
-  // Returns what the dialog needs, or a version of it with no picture when the
-  // passphrase is not available -- which is the case until the machine's
-  // camera-ap helper is reinstalled, since older copies do not report it.
-  async function buildJoinQr(data) {
-    const base = {
-      ssid: data.ssid ?? "CameraPi",
-      address: data.ap_address,
-      passphrase: data.passphrase || null,
-      image: null,
-    };
-    if (!base.passphrase) return base;
-    try {
-      // Plain black on white and a generous margin: a QR is read by a camera
-      // pointed at a screen, and styling it is how it stops scanning.
-      base.image = await QRCode.toDataURL(
-        wifiPayload(base.ssid, base.passphrase),
-        { width: 240, margin: 2, color: { dark: "#000000", light: "#ffffff" } },
-      );
-    } catch (error) {
-      console.error("Could not draw the WiFi QR code:", error);
-    }
-    return base;
-  }
-
-  async function applyAccessPoint(enabled) {
-    setAccessPointBusy(true);
-    try {
-      const response = await fetch(`${API_BASE}/wifi_ap`, {
-        method: "POST",
-        headers: jsonHeaders(),
-        ...SEND_COOKIE,
-        body: JSON.stringify({ enabled }),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        toast.error(data.detail || "Impossibile cambiare la rete WiFi.", {
-          id: TOAST_WIFI,
-        });
-        return;
-      }
-      setAccessPoint(data);
-      if (data.state === "on") {
-        // An ordinary confirmation now, not a toast that never goes away. The
-        // address it used to carry is on the panel below for as long as the
-        // network is up: a thing you have to copy down belongs somewhere it
-        // stays, not in a message that is also covering the page.
-        toast.success(`Rete « ${data.ssid ?? "CameraPi"} » attiva.`, {
-          id: TOAST_WIFI,
-        });
-        // ...and the dialog, which is the part you can actually point a phone
-        // at. Opened whether or not a QR could be made: without the passphrase
-        // it still shows the network name and the address, which is strictly
-        // more than the toast alone gave.
-        setJoinQr(await buildJoinQr(data));
-      } else if (data.state === "off") {
-        toast.success("Rete WiFi spenta.", { id: TOAST_WIFI });
-      } else {
-        toast.error(data.detail || "Stato della rete WiFi sconosciuto.", {
-          id: TOAST_WIFI,
-          duration: Infinity,
-        });
-      }
-    } catch (error) {
-      console.error("Failed to change the access point:", error);
-      toast.error("Impossibile contattare il server.", { id: TOAST_WIFI });
-    } finally {
-      setAccessPointBusy(false);
-    }
-  }
-
   async function scanUsbDevices() {
     setScanning(true);
     try {
       const response = await fetch(`${API_BASE}/camera_devices`, SEND_COOKIE);
       const data = await response.json();
       setUsbDevices(data.devices);
-      // Older servers do not send this field; treat its absence as "present"
-      // so the button keeps working against them.
-      setHasPiCamera(data.picamera !== false);
+      setHasPiCamera(data.picamera === true);
     } catch (error) {
       console.error("Failed to scan for cameras:", error);
       setUsbDevices([]);
@@ -2083,6 +1630,52 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
       setScanning(false);
     }
   }
+
+  async function scanLocalVideoDevices(announce = false) {
+    setLocalDeviceScanning(true);
+    try {
+      if (!navigator.mediaDevices?.enumerateDevices) {
+        setLocalVideoDevices([]);
+        if (announce) {
+          toast.error(
+            window.isSecureContext === false
+              ? "La ricerca delle videocamere richiede HTTPS o localhost."
+              : "Questo browser non permette di elencare le videocamere.",
+          );
+        }
+        return;
+      }
+      const found = (await navigator.mediaDevices.enumerateDevices())
+        .filter((device) => device.kind === "videoinput")
+        .map((device, index) => ({
+          deviceId: device.deviceId,
+          label: device.label || `Videocamera ${index + 1}`,
+        }));
+      setLocalVideoDevices(found);
+      setSelectedLocalDeviceId((current) =>
+        found.some((device) => device.deviceId === current)
+          ? current
+          : found.find((device) => device.deviceId)?.deviceId ?? "",
+      );
+    } catch (error) {
+      console.error("Failed to scan this device's cameras:", error);
+      setLocalVideoDevices([]);
+      if (announce) toast.error("Impossibile elencare le videocamere di questo dispositivo.");
+    } finally {
+      setLocalDeviceScanning(false);
+      setLocalDeviceScanComplete(true);
+    }
+  }
+
+  useEffect(() => {
+    if (clientIsServer) return undefined;
+    void scanLocalVideoDevices();
+    const mediaDevices = navigator.mediaDevices;
+    if (!mediaDevices?.addEventListener) return undefined;
+    const refresh = () => void scanLocalVideoDevices();
+    mediaDevices.addEventListener("devicechange", refresh);
+    return () => mediaDevices.removeEventListener("devicechange", refresh);
+  }, [clientIsServer]);
 
   /** One instant of the capture-burst flash. Re-triggerable mid-flash (a new
    * frame can land before the previous flash has faded), which is why this
@@ -2102,7 +1695,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
    * Grabbed from the picture already on screen, so the device holding the
    * camera stores its OWN frames at full quality: nothing makes the round trip
    * to the server and back, and a watching device stores what it is watching.
-   * Same choice of element as captureCrops makes for faces.
+   * Same choice of element as captureCrops.
    *
    * Spaced out rather than taken in one tick, and the reason is the whole
    * value of the set: ten frames from one instant are ten copies of one pose.
@@ -2942,7 +2535,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
       setObjectDetail(data.object ?? null);
       const references = data.object?.detector?.references ?? 1;
       toast.success(
-        `« ${data.object.name} » ora si puo' scegliere in Detect ` +
+        `« ${data.object.name} » ora si puo' scegliere nel rilevamento ` +
           `(${references} foto di riferimento).`,
       );
     } catch (error) {
@@ -2953,33 +2546,14 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     }
   }
 
-  async function loadDetectionClasses() {
-    try {
-      const response = await fetch(
-        `${API_BASE}/detection_classes`,
-        SEND_COOKIE,
-      );
-      const data = await response.json();
-      // Italian labels; fall back to the English ones if the backend is older.
-      setCocoClasses(data.classes_it ?? data.classes);
-      // Never the Italian ones: this is what detections are matched against.
-      setCocoNames(data.classes ?? {});
-    } catch (error) {
-      console.error("Failed to load detection classes:", error);
-    }
-  }
-
   // Scan once automatically on load; the "Scan for cameras" button lets
   // you re-run it later (e.g. after plugging in a different camera).
   useEffect(() => {
     scanUsbDevices();
   }, []);
 
-  // Load the YOLO class list once so the detection picker can label options.
-  // (The effect callback itself can't be async -- it must return a cleanup
-  // function or nothing -- so it calls the async helper above.)
+  // Load available custom classifiers once on startup.
   useEffect(() => {
-    loadDetectionClasses();
     loadObjects();
   }, []);
 
@@ -3043,7 +2617,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         setServerSaving(Boolean(data.server_camera_saving));
         if (typeof data.camera_shared === "boolean")
           setCameraShared(data.camera_shared);
-        setPiCameraOn(Boolean(data.server_camera_on));
         setServerActive(data.detection_config?.active !== false);
         // The server's half of the sharing measurements. Absent when nobody is
         // publishing, which is also when the panel that shows it is hidden.
@@ -3077,29 +2650,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
             setActiveIndex(data.device_index);
         }
         const choice = choiceFromConfig(data.detection_config);
-        if (choice !== null) setDetectionChoice(choice);
-        // Where detection runs is shared state too -- see locationChoice.
-        // Not taken from a face config: that one is always "browser" and
-        // would wipe a "server" picked for hands the moment faces were shown.
-        // Not from a classifier config either, for the mirror-image reason:
-        // that one is always "server", and adopting it would leave every
-        // OTHER backend's "Dove rilevare" stuck on "server" the moment
-        // anyone picked a classifier, even after switching back to hands.
-        const shared = data.detection_config;
-        if (
-          shared &&
-          shared.backend !== "face" &&
-          shared.backend !== "classifier" &&
-          (shared.location === "browser" || shared.location === "server")
-        ) {
-          setLocationChoice(shared.location);
-          if (
-            shared.location === "server" &&
-            (shared.num_hands === 1 || shared.num_hands === 2)
-          ) {
-            setHandCount(String(shared.num_hands));
-          }
-        }
+        setDetectionChoice(choice);
       } catch {
         // A missed heartbeat is not worth showing: the next one is 5 s away,
         // and the server keeps the device for 20 s.
@@ -3129,87 +2680,45 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     };
   }, []);
 
-  // --- Starting this device's own camera without being asked -------------
-  //
-  // The catch is that the source is a SERVER-WIDE setting: choosing it here
-  // switches every connected page and stops the camera they were watching.
-  // These three refusals are therefore absolute, whoever is logged in:
-  //
-  //   - not the machine running the server, which cannot publish its camera
-  //     through the browser anyway;
-  //   - nobody else is publishing, so no running share is ever taken over;
-  //   - and the device must actually HAVE a camera -- see below.
-  //
-  // Past those, there are two reasons to do it:
-  //
-  //   the ROLE -- an operatore's job is to be the camera. That is the whole
-  //     distinction between the two roles: an amministratore watches, an
-  //     operatore is watched. So an operatore's own camera is what their page
-  //     should open on, regardless of what else is connected.
-  //   the DEVICE -- a phone (touch-only), whoever is logged in and whatever
-  //     else is connected. It used to be only a phone that was the ONLY
-  //     device connected, which never fired with the PC's page open too.
-  //
-  // Once per page load, whatever happens afterwards: a ref, not state, because
-  // a second attempt would fight whatever the user chose by hand in between.
-  const autoCameraDone = useRef(false);
+  // On a phone, make the first camera available as a local preview. This must
+  // not change the server-wide source or start the share; both are explicit
+  // actions. A camera already selected by another publisher remains untouched.
+  const autoLocalPreviewDone = useRef(false);
   useEffect(() => {
-    if (autoCameraDone.current) return;
-    // Nothing is known until the first heartbeat has answered.
-    if (firstBeat.current || switching) return;
-    if (clientIsServer) return;
-    if (publisherId !== null) return;
-    if (source === "remote") return;
-
-    // Every page turns its own camera on when it opens (not shared) -- unless
-    // the Pi's camera is already on: that one is not switched off by a page
-    // that merely opened.
-    if (piCameraOn) return;
-
-    // Claimed BEFORE the await below, so a heartbeat arriving while the device
-    // list is being read cannot start this a second time.
-    autoCameraDone.current = true;
-    (async () => {
-      // Check there is a camera before taking the source away from everybody.
-      // An operatore logging in on a desktop with no webcam would otherwise
-      // stop the Raspberry's camera for every other device and then publish
-      // nothing -- the whole system blank, from a page that never asked for
-      // anything. enumerateDevices needs no permission to report that a video
-      // input EXISTS; only the labels are withheld until permission is given.
-      // Silent until now, which was wrong in one of the two cases: a browser
-      // with no camera API at all looks identical to a page that simply chose
-      // not to start sharing, and the user is left with no camera and no
-      // reason. A missing API gets said once; a machine with no webcam stays
-      // quiet, because that is ordinary and not a fault.
-      if (!navigator.mediaDevices?.enumerateDevices) {
-        toast.error(
-          window.isSecureContext === false
-            ? "La fotocamera richiede HTTPS: apri la pagina con https://."
-            : "Questo browser non espone le fotocamere (Tor Browser le " +
-                "disattiva): puoi guardare il video, non condividerlo.",
-          { id: TOAST_SHARE, duration: Infinity },
-        );
-        return;
-      }
-      try {
-        const found = await navigator.mediaDevices.enumerateDevices();
-        if (!found.some((device) => device.kind === "videoinput")) return;
-      } catch {
-        // A browser that will not answer is not one to take the source for.
-        return;
-      }
-      selectSource("remote");
-    })();
+    if (autoLocalPreviewDone.current) return;
+    if (touchOnly !== true || localDeviceScanning || !localDeviceScanComplete)
+      return;
+    if (firstBeat.current || switching || clientIsServer || publisherId !== null)
+      return;
+    if (localVideoDevices.length === 0) return;
+    autoLocalPreviewDone.current = true;
+    setLocalCameraPreview(true);
   }, [
-    account.is_admin,
     touchOnly,
+    switching,
     clientIsServer,
     publisherId,
-    deviceList,
-    source,
-    switching,
-    piCameraOn,
+    localDeviceScanning,
+    localDeviceScanComplete,
+    localVideoDevices,
   ]);
+
+  async function toggleClientSharing() {
+    if (someoneElseShares) return;
+    if (sharing) {
+      setSharing(false);
+      return;
+    }
+    if (!capturesOwnCamera && !(localCameraPreview && !clientIsServer)) {
+      toast.error("Seleziona prima una videocamera di questo dispositivo.", {
+        id: TOAST_SHARE,
+      });
+      return;
+    }
+    if (!capturesOwnCamera && !(await selectSource("remote"))) return;
+    if (wideScreen !== true) setAppOpen(false);
+    setSharing(true);
+  }
 
   // On the server machine itself the device's own camera is the Pi's: the camera
   // module if there is one, otherwise the first USB webcam, and nothing if
@@ -3220,13 +2729,20 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     if (firstBeat.current || switching || !clientIsServer) return;
     if (usbDevices === null) return; // the scan has not answered yet
     piStartDone.current = true;
-    if (source !== "none") return; // already on: leave it
-    if (hasPiCamera) {
-      selectSource("picamera", undefined, undefined, false);
-    } else if (usbDevices.length > 0) {
-      selectSource("usb", usbDevices[0], undefined, false);
+    if (source === "remote") return;
+    const firstUsb = usbDevices[0];
+    if (firstUsb !== undefined) {
+      if (source !== "usb" || activeIndex !== firstUsb) {
+        selectSource("usb", firstUsb, undefined, false);
+      }
+    } else if (hasPiCamera) {
+      if (source !== "picamera") {
+        selectSource("picamera", undefined, undefined, false);
+      }
+    } else if (source !== "none") {
+      selectSource("none");
     }
-  }, [clientIsServer, switching, usbDevices, hasPiCamera, source]);
+  }, [activeIndex, clientIsServer, switching, usbDevices, hasPiCamera, source]);
 
   useEffect(() => {
     const sync = () => setPageVisible(!document.hidden);
@@ -3283,20 +2799,16 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         return;
       }
 
-      // facingMode is a preference, not a requirement: phones pick the rear
-      // camera, laptops just use the only one they have.
-      stream = await navigator.mediaDevices.getUserMedia({
-        // `ideal`, not `exact`: a camera that cannot do this size still opens,
-        // at whatever it can manage. Without a width a phone hands back its
-        // native maximum -- often 1920x1080 or more -- and every frame of that
-        // is then downscaled for the detector and re-encoded for the upload
-        // anyway, so the extra pixels are paid for and thrown away.
-        video: { facingMode: "environment", width: { ideal: 1280 } },
-      });
+      stream = await navigator.mediaDevices.getUserMedia(
+        cameraConstraints(selectedLocalDeviceId),
+      );
       if (cancelled) {
         stream.getTracks().forEach((t) => t.stop());
         return;
       }
+      const activeDeviceId = stream.getVideoTracks()[0]?.getSettings().deviceId;
+      if (activeDeviceId) setSelectedLocalDeviceId(activeDeviceId);
+      void scanLocalVideoDevices();
       cameraTrackRef.current = stream.getVideoTracks()[0] ?? null;
       // The camera was reopened (sharing turned on or off): keep the zoom.
       if (zoomRef.current != null) applyZoom(zoomRef.current);
@@ -3313,7 +2825,12 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
       video.srcObject = stream;
       video.muted = true;
       video.playsInline = true;
-      await video.play();
+      try {
+        await video.play();
+      } catch (error) {
+        if (cancelled) return;
+        if (error.name !== "AbortError") throw error;
+      }
 
       // Send small, not at the camera's own resolution. A phone hands back
       // 1280x720 or 1920x1080, which at 10 fps is megabytes a second of WiFi
@@ -3400,10 +2917,20 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
       // how old the picture it is looking at really is.
       ws.onmessage = (event) => {
         if (typeof event.data !== "string") return;
-        if (!event.data.startsWith("ping:")) return;
-        const sentAt = Number(event.data.slice(5));
-        if (Number.isFinite(sentAt)) {
-          meterRef.current.linkRttMs = performance.now() - sentAt;
+        if (event.data.startsWith("ping:")) {
+          const sentAt = Number(event.data.slice(5));
+          if (Number.isFinite(sentAt)) {
+            meterRef.current.linkRttMs = performance.now() - sentAt;
+          }
+          return;
+        }
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === "error") {
+            toast.error(message.detail, { id: TOAST_SHARE });
+          }
+        } catch {
+          return;
         }
       };
       pingId = setInterval(() => {
@@ -3524,7 +3051,13 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     };
     // React runs the cleanup above whenever `pageVisible` flips to false,
     // which releases the camera (LED off) without any extra code here.
-  }, [capturesOwnCamera, importedVideo, pageVisible, sharing]);
+  }, [
+    capturesOwnCamera,
+    importedVideo,
+    pageVisible,
+    sharing,
+    selectedLocalDeviceId,
+  ]);
 
   // Detection for this page's OWN camera, done by the server. Frames go to
   // /detect_ws at DETECT_FPS, whether or not this device is sharing; what comes
@@ -3552,11 +3085,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
       ? { text: "Caricamento...", backend: "text" }
       : {
           text: "Avvio rilevamento…",
-          backend: detectionConfigFor(
-            detectionChoice,
-            importedVideo ? detectionLocation : "browser",
-            handCount,
-          ).backend,
+          backend: "classifier",
         };
     setDetectPending(detectPendingRef.current);
     // Where this device is, sent to the server with the frames so the
@@ -3634,11 +3163,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
       ctx.setTransform(canvas.pixelScale, 0, 0, canvas.pixelScale, 0, 0);
       ctx.clearRect(0, 0, width, height);
       const items = message.items ?? [];
-      if (message.backend === "face") {
-        drawFaces(ctx, items, null, videoFitRef.current);
-      } else {
-        drawDetections(ctx, items, videoFitRef.current);
-      }
+      drawDetections(ctx, items, videoFitRef.current);
       if (message.backend === "text") textBoxesRef.current = message;
       setDetectionReady(true);
       clearTimeout(staleTimer);
@@ -3687,7 +3212,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
             pause_key: video.paused
               ? `${importedVideoSeekIdRef.current}:${video.currentTime.toFixed(3)}`
               : null,
-            save: detectOn || importedVideo || (textOn && textSave),
+            save: detectOn || (textOn && textSave),
           }
         : null;
       const scale = Math.min(1, UPLOAD_WIDTH / video.videoWidth);
@@ -3782,7 +3307,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         detectPendingRef.current = null;
         setDetectPending(null);
         setDetectionReady(true);
-      }
+      } else if (message.type === "error") handleDetectionError(message.detail);
     };
     ws.onclose = (event) => {
       if (cancelled) return;
@@ -3793,6 +3318,18 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
           id: TOAST_DETECT,
           duration: Infinity,
         });
+        return;
+      }
+      if (event.code === 1011) {
+        detectPendingRef.current = null;
+        setDetectPending(null);
+        setDetectOn(false);
+        setDetectOnlyOn(false);
+        setTextOn(false);
+        toast.error(
+          "Errore interno del server durante il rilevamento. Controlla il log del server.",
+          { id: TOAST_DETECT, duration: Infinity },
+        );
         return;
       }
       toast.error("Rilevamento sul server interrotto: riprovo tra poco.", {
@@ -3839,7 +3376,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   // server runs ONE session for every page that has this open.
   useEffect(() => {
     const serverObserving =
-      detectOn || textOn || (detectOnlyOn && detectionLocation === "server");
+      detectOn || detectOnlyOn || textOn;
     if (
       importedVideo ||
       localCameraPreview ||
@@ -3854,11 +3391,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
       ? { text: "Caricamento...", backend: "text" }
       : {
           text: "Avvio rilevamento…",
-          backend: detectionConfigFor(
-            detectionChoice,
-            detectionLocation,
-            handCount,
-          ).backend,
+          backend: "classifier",
         };
     setDetectPending(detectPendingRef.current);
     const query = textOn
@@ -3887,6 +3420,8 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         setDetectionReady(true);
       } else if (message.type === "text_status") {
         setTextReading(Boolean(message.reading));
+      } else if (message.type === "error") {
+        handleDetectionError(message.detail);
       }
     };
     ws.onclose = (event) => {
@@ -3904,6 +3439,18 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
           id: TOAST_DETECT,
           duration: Infinity,
         });
+        return;
+      }
+      if (event.code === 1011) {
+        detectPendingRef.current = null;
+        setDetectPending(null);
+        setDetectOn(false);
+        setDetectOnlyOn(false);
+        setTextOn(false);
+        toast.error(
+          "Errore interno del server durante il rilevamento. Controlla il log del server.",
+          { id: TOAST_DETECT, duration: Infinity },
+        );
         return;
       }
       toast.error("Rilevamento sul server interrotto: riprovo tra poco.", {
@@ -3929,7 +3476,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     detectRetry,
     detectOn,
     detectOnlyOn,
-    detectionLocation,
     textOn,
     textSave,
     importedVideo,
@@ -3953,10 +3499,12 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     // Osserva starts on whenever there is a camera to observe: this device's
     // own and the Pi's webcam alike -- the objects' or, in text mode, the text's.
     const live = cameraKind === "own" || cameraKind === "pi";
-    setDetectOnlyOn(live && !textMode);
+    setDetectOnlyOn(
+      live && !textMode && isClassifierChoice(detectionChoice),
+    );
     setTextOn(live && textMode);
     setTextSave(false);
-  }, [cameraKind, importedVideo]);
+  }, [cameraKind, importedVideo, detectionChoice]);
 
   // Tells the server when the Pi's webcam should detect: only while Osserva or
   // Avvia is on. Sent only when what the SERVER reports differs from the
@@ -3994,68 +3542,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   //
   // The first heartbeat above now reports what the server is already on, and
   // that is adopted instead. Nothing is posted until a button is pressed.
-
-  // Load whichever model the current choice needs, and tear it down when
-  // detection moves back to the server.
-  useEffect(() => {
-    // A classifier never runs in the browser -- the method needs server-side
-    // MediaPipe tasks (see classifier_detection.py) -- including on this
-    // device's own camera, where detectionLocation stays "browser" for every
-    // OTHER backend because DetectSession already detects server-side
-    // regardless of this value. Without this guard a classifier choice fell
-    // through to the "yolo" default below and tried to load EfficientDet
-    // here for nothing.
-    if (
-      detectionLocation !== "browser" ||
-      !detectsHere ||
-      importedVideo ||
-      localCameraPreview ||
-      isClassifierChoice(detectionChoice)
-    ) {
-      detectorRef.current?.close();
-      detectorRef.current = null;
-      setDetectorStatus("");
-      return;
-    }
-    let cancelled = false;
-    let backend = "yolo";
-    if (detectionChoice === FACE_OPTION) backend = "face";
-    else if (detectionChoice === HAND_OPTION) backend = "mediapipe";
-    setDetectorStatus(
-      {
-        face: "Caricamento modello volti (~230 KB)...",
-        mediapipe: "Caricamento modello mani (~8 MB)...",
-        yolo: "Caricamento modello oggetti (~14 MB)...",
-      }[backend],
-    );
-    const detector = detectorRef.current ?? new BrowserDetector();
-    detectorRef.current = detector;
-    detector
-      .ensureLoaded(backend, cocoNames)
-      .then(() => {
-        if (!cancelled) setDetectorStatus("");
-      })
-      .catch((error) => {
-        console.error("Detector failed to load:", error);
-        if (!cancelled) {
-          // The video keeps playing; only the boxes are missing. Say so rather
-          // than leaving a silently empty overlay.
-          setDetectorStatus(
-            `Rilevamento non disponibile su questo dispositivo: ${error.message}`,
-          );
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [
-    detectionLocation,
-    detectionChoice,
-    detectsHere,
-    importedVideo,
-    localCameraPreview,
-    cocoNames,
-  ]);
 
   // Pulls the video from the server one frame at a time.
   //
@@ -4257,290 +3743,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     return () => clearTimeout(timer);
   }, [watchPending]);
 
-  // The detection loop. Draws the current frame onto the overlay canvas, runs
-  // the detector on it, draws the result, and reports it to the server.
-  useEffect(() => {
-    // Same reason as the model-loading effect above: a classifier never runs
-    // in the browser, on this device's own camera included.
-    if (
-      detectionLocation !== "browser" ||
-      !pageVisible ||
-      !detectsHere ||
-      importedVideo ||
-      isClassifierChoice(detectionChoice)
-    )
-      return;
-    let frameRequest = 0;
-    let running = true;
-    let busy = false;
-    reporterRef.current =
-      reporterRef.current ?? new DetectionReporter(postDetections);
-    // Carries num_hands, which the worker applies with each frame.
-    const config = detectionConfigFor(detectionChoice, "browser", handCount);
-    if (!detectionReady) {
-      detectPendingRef.current = {
-        text: "Avvio rilevamento…",
-        backend: config.backend,
-      };
-      setDetectPending(detectPendingRef.current);
-    }
-    const detectWidth =
-      config.backend === "face" ? FACE_DETECT_WIDTH : DETECT_WIDTH;
-
-    // One scratch canvas for the whole loop, reused every frame: allocating a
-    // new one per frame would cost more than the downscale it exists for.
-    // TEMPORARY diagnostic for the skeleton's lag on a phone -- remove once it
-    // has been read. Collects, per detection: the model's own time (measured
-    // in the worker), the whole round trip from copying the frame to the
-    // answer arriving, and the drawing after it; shows their medians twice a
-    // second, with how many detections a second that came to.
-    const timingSamples = [];
-    let timingShownAt = performance.now();
-    function recordTiming(startedAt, detectedAt, drawnAt) {
-      timingSamples.push({
-        model: detectorRef.current?.lastModelMs ?? null,
-        roundTrip: detectedAt - startedAt,
-        draw: drawnAt - detectedAt,
-      });
-      const now = performance.now();
-      if (now - timingShownAt < 500) return;
-      const median = (key) => {
-        const values = timingSamples
-          .map((sample) => sample[key])
-          .filter((value) => value != null)
-          .sort((a, b) => a - b);
-        return values.length
-          ? Math.round(values[Math.floor(values.length / 2)])
-          : null;
-      };
-      setDetectTiming({
-        delegate: detectorRef.current?.lastDelegate ?? null,
-        renderer: detectorRef.current?.renderer ?? null,
-        model: median("model"),
-        roundTrip: median("roundTrip"),
-        draw: median("draw"),
-        perSecond:
-          Math.round(
-            (timingSamples.length / ((now - timingShownAt) / 1000)) * 10,
-          ) / 10,
-      });
-      timingSamples.length = 0;
-      timingShownAt = now;
-    }
-
-    const small = document.createElement("canvas");
-    const smallCtx = small.getContext("2d", { willReadFrequently: false });
-
-    async function tick(timestamp) {
-      if (!running) return;
-      const canvas = overlayRef.current;
-      // For "remote" the page has the camera itself, so detect straight from
-      // the <video> and skip the round trip through the Pi entirely.
-      const media = capturesOwnCamera
-        ? remoteVideoRef.current
-        : videoImgRef.current;
-      const sourceWidth = media?.videoWidth || media?.naturalWidth || 0;
-      const sourceHeight = media?.videoHeight || media?.naturalHeight || 0;
-      // Never scale UP: a source already smaller than the detect width is used
-      // as it is, rather than being blown up into more pixels than it has.
-      const scale = Math.min(1, detectWidth / (sourceWidth || 1));
-      const width = Math.round(sourceWidth * scale);
-      const height = Math.round(sourceHeight * scale);
-
-      if (canvas && media && width && height && !busy) {
-        busy = true;
-        // The bitmap is made as large as the overlay is SHOWN, in device
-        // pixels, and a transform maps the detector's coordinates onto it.
-        // It used to be exactly the detector's size -- 480 or 640 px across
-        // -- and the browser stretched it to fill the picture, so on a big or
-        // high-density screen every line and caption was blown up and blurred.
-        // Drawing code is unchanged: it still works in detector pixels, and
-        // drawingSize() in hittest.js gives it that size back for taps and
-        // caption sizing.
-        const shownPx =
-          (canvas.clientWidth || width) * (window.devicePixelRatio || 1);
-        const bitmapWidth = Math.round(
-          width * Math.min(MAX_OVERLAY_SCALE, Math.max(1, shownPx / width)),
-        );
-        const pixelScale = bitmapWidth / width;
-        const bitmapHeight = Math.round(height * pixelScale);
-        if (canvas.width !== bitmapWidth || canvas.height !== bitmapHeight) {
-          canvas.width = bitmapWidth;
-          canvas.height = bitmapHeight;
-        }
-        canvas.pixelScale = pixelScale;
-        if (small.width !== width || small.height !== height) {
-          small.width = width;
-          small.height = height;
-        }
-        const ctx = canvas.getContext("2d");
-        try {
-          // The one copy this loop makes, and the reason it is worth it: the
-          // detector gets DETECT_WIDTH pixels instead of the camera's full
-          // frame. Nothing is copied into the VISIBLE canvas -- the picture on
-          // screen is still the <img>/<video> underneath it.
-          const startedAt = performance.now(); // TEMPORARY, see recordTiming
-          smallCtx.drawImage(media, 0, 0, width, height);
-          const detections = await detectorRef.current?.detect(
-            small,
-            width,
-            height,
-            config,
-            timestamp,
-          );
-          if (detections !== undefined && !detectionReady) {
-            setDetectionReady(true);
-            detectPendingRef.current = null;
-            setDetectPending(null);
-          }
-          const detectedAt = performance.now(); // TEMPORARY, see recordTiming
-          // Cleared HERE, with the new marks already in hand -- not before the
-          // await. Clearing first left this layer empty for the whole detection
-          // and drew on it for one frame at the end: measured at 2828 ms blank
-          // against 116 ms of marks, so the boxes were on screen 4% of the time.
-          // That is what made them look like they blink rather than lag. The
-          // old marks now stay up until the new ones replace them, which is
-          // also what the local hand-mouse program does by drawing onto the
-          // frame it analysed.
-          // Set on every pass: resizing the canvas above resets it.
-          ctx.setTransform(pixelScale, 0, 0, pixelScale, 0, 0);
-          ctx.clearRect(0, 0, width, height);
-          if (detections) {
-            if (config.backend === "face") {
-              const largeEnough = detections.filter(
-                (detection) =>
-                  detection.bbox[2] - detection.bbox[0] >= enrolMinFacePx,
-              );
-              // Give each face a stable id so a tap keeps pointing at the same
-              // person while they move, and so the identity fetched once can be
-              // reused instead of asking the server again every frame.
-              const updated = trackerRef.current.update(largeEnough);
-              // A track that just came back carries an identity from before it
-              // vanished. It is shown at once -- that is the point of reviving
-              // it -- but it is also re-checked at once, by clearing when it
-              // was last asked about, so a face that changed while the box was
-              // gone is corrected in about a second.
-              for (const detection of updated) {
-                if (!detection.revived) continue;
-                const meta = recogMetaRef.current.get(detection.trackId);
-                if (meta) meta.lastAt = 0;
-              }
-              const tracked = updated
-                // A box seen in a single frame is not a face yet. Filtering
-                // here means the whole app -- drawing, tapping, recognising,
-                // saving -- only ever sees confirmed ones.
-                .filter((detection) => detection.confirmed);
-              faceDetectionsRef.current = tracked;
-              faceDetectWidthRef.current = width;
-              // Ask about a new face in the frame it becomes a face, rather
-              // than waiting for the scheduler's next turn. That wait was up
-              // to 200 ms of doing nothing at all, on the one occasion the
-              // user is actually watching for an answer.
-              if (!recogniseBusyRef.current) {
-                const fresh = tracked.find((d) => {
-                  if (recogMetaRef.current.has(d.trackId)) return false;
-                  // Same floor the scheduler applies: a face too far away to
-                  // identify would only come back "too_small", and asking
-                  // costs a round trip somebody else is waiting for. A width
-                  // of 0 means unmeasurable, which is not the same as tiny.
-                  const px = sourceFaceWidth(d);
-                  return !px || px >= minFacePxRef.current;
-                });
-                if (fresh) recogniseTrack(fresh);
-              }
-              // The tile sweep is the expensive path and it runs on this
-              // thread; while an answer is on its way, the thread's job is to
-              // be free to receive it.
-              if (detectorRef.current) {
-                detectorRef.current.deferSweep = recogniseBusyRef.current;
-              }
-              // ...and only confirmed boxes are worth re-finding next frame,
-              // which is what stops a false positive from feeding itself.
-              detectorRef.current?.setTrackedRegions(
-                tracked.map((d) => d.bbox),
-              );
-              // Via the ref, not the state: this runs on requestAnimationFrame
-              // and the loop is created once, so the state would stay frozen
-              // at whatever the fit was when sharing started.
-              drawFaces(
-                ctx,
-                tracked,
-                selectedTrackRef.current,
-                videoFitRef.current,
-              );
-            } else {
-              drawDetections(ctx, detections, videoFitRef.current);
-            }
-            reporterRef.current.report(source, detections);
-          }
-          recordTiming(startedAt, detectedAt, performance.now()); // TEMPORARY
-        } catch (error) {
-          // One bad frame must not kill the loop -- MediaPipe throws if the
-          // <img> is mid-refresh, which happens routinely on an MJPEG stream.
-          console.debug("detect skipped a frame:", error);
-        }
-        busy = false;
-      }
-      frameRequest = requestAnimationFrame(tick);
-    }
-
-    frameRequest = requestAnimationFrame(tick);
-    return () => {
-      running = false;
-      cancelAnimationFrame(frameRequest);
-      reporterRef.current?.reset();
-      setDetectTiming(null); // TEMPORARY, see recordTiming
-      // Wipe the layer on the way out. The marks now survive until new ones
-      // replace them, which is the point -- but when this loop STOPS there are
-      // no new ones coming, so without this the last boxes would sit frozen on
-      // the picture after switching what is detected, after the panel is
-      // closed, or after sharing ends.
-      const leftover = overlayRef.current;
-      if (leftover) {
-        leftover
-          .getContext("2d")
-          ?.clearRect(0, 0, leftover.width, leftover.height);
-      }
-    };
-  }, [
-    detectionLocation,
-    detectionChoice,
-    handCount,
-    enrolMinFacePx,
-    source,
-    importedVideo,
-    capturesOwnCamera,
-    detectsHere,
-    pageVisible,
-  ]);
-
-  /** Everyone enrolled, plus the judge colours and size limits. Kept in one
-   * place so the box on the video, the traffic light and the "add to an
-   * existing person" list all agree with the server rather than each other. */
-  async function loadFaces() {
-    try {
-      const response = await fetch(`${API_BASE}/faces`, SEND_COOKIE);
-      if (!response.ok) return;
-      const data = await response.json();
-      setFaceJudges(data.judges ?? null);
-      setDefaultJudge(data.default_judge ?? "accettabile");
-      setPeople(data.people ?? []);
-      if (data.enrol_min_face_px) setEnrolMinFacePx(data.enrol_min_face_px);
-      if (data.min_face_px) minFacePxRef.current = data.min_face_px;
-      if (data.models_ready === false) {
-        toast.error(
-          "I modelli di riconoscimento non sono ancora sul server: i volti " +
-            "vengono trovati ma non identificati.",
-          { id: TOAST_FACES },
-        );
-      }
-      return data;
-    } catch {
-      // The heartbeat will bring the page back; nothing here is worth a toast.
-      return null;
-    }
-  }
-
   // --- The strip of what the server found (DetectionStrip) ----------------
 
   // The list as last rendered, for counting inside the handlers below.
@@ -4548,31 +3750,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
   useEffect(() => {
     savedEntriesRef.current = savedEntries;
   }, [savedEntries]);
-  // The people list as it is now, for takeSavedEntries: /detect_ws calls it
-  // from a closure made when the socket opened, whose `people` is stale.
-  const peopleRef = useRef([]);
-  peopleRef.current = people;
-
-  // A recognised face's caption is written in that person's semaphore colour,
-  // from the list of people. A name whose person is not in the list yet --
-  // saved a moment ago, or on another device -- reloads it, once per person.
-  useEffect(() => {
-    const missing = savedEntries.filter(
-      (entry) =>
-        entry.person_id &&
-        !people.some((person) => person.id === entry.person_id) &&
-        !peopleAskedRef.current.has(entry.person_id),
-    );
-    if (!missing.length) return;
-    missing.forEach((entry) => peopleAskedRef.current.add(entry.person_id));
-    loadFaces();
-  }, [savedEntries, people]);
-
-  function savedColour(entry) {
-    return (
-      people.find((person) => person.id === entry.person_id)?.color ?? null
-    );
-  }
 
   /** Puts entries into the strip -- the whole list (`replace`) or a few new
    * ones from /detect_ws -- and toasts the ones this page had not seen. */
@@ -4594,27 +3771,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         ];
     savedEntriesRef.current = next;
     setSavedEntries(next);
-    if (fresh.length) {
-      // A face's name in its person's semaphore colour, on the same dark
-      // background as the strip's captions. A person
-      // this page has not loaded yet (saved a moment ago, or on another
-      // device) is loaded first, so the toast waits for the list.
-      const unloaded = fresh.filter(
-        (entry) =>
-          entry.person_id &&
-          !peopleRef.current.some((person) => person.id === entry.person_id),
-      );
-      if (unloaded.length) {
-        unloaded.forEach((entry) =>
-          peopleAskedRef.current.add(entry.person_id),
-        );
-        loadFaces().then((data) =>
-          toastSaved(fresh, data?.people ?? peopleRef.current),
-        );
-      } else {
-        toastSaved(fresh, peopleRef.current);
-      }
-    }
+    if (fresh.length) toastSaved(fresh);
     // On opening the page, and whenever new pictures arrive while above it.
     if ((fresh.length || !seen) && next.length > SAVED_WARN_ABOVE) {
       toast.warning(
@@ -4624,39 +3781,11 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     }
   }
 
-  function toastSaved(fresh, peopleList) {
-    // A recognised person gets a toast of their own, coloured with their
-    // semaphore and written in black, which reads best on all three colours
-    // (contrast 4.7 to 8.5; white is 2.5 on orange). Its own id, so the next
-    // batch of the same person replaces it rather than stacking.
-    const recognised = new Map();
-    const others = [];
-    for (const entry of fresh) {
-      // Text somebody chose to read and keep: not something the camera
-      // "detected", and the person who saved it was already told, with
-      // whether a position went with it.
-      if (entry.kind === "text") continue;
-      if (entry.kind === "face" && entry.person_id) {
-        if (!recognised.has(entry.person_id))
-          recognised.set(entry.person_id, entry.label);
-        continue;
-      }
-      const label = entry.kind === "face" ? "volto sconosciuto" : entry.label;
-      if (!others.includes(label)) others.push(label);
-    }
-    for (const [personId, label] of recognised) {
-      const colour = peopleList.find((person) => person.id === personId)?.color;
-      toast(`Rilevato: ${label}`, {
-        id: `${TOAST_SAVED}-${personId}`,
-        style: colour
-          ? { background: colour, borderColor: colour, color: "black" }
-          : undefined,
-      });
-    }
-    // Unknown faces, hands and objects: one ordinary toast, replaced -- a
-    // batch is three pictures, not three messages.
-    if (others.length)
-      toast(`Rilevato: ${others.join(", ")}`, { id: TOAST_SAVED });
+  function toastSaved(fresh) {
+    const labels = [...new Set(
+      fresh.filter((entry) => entry.kind !== "text").map((entry) => entry.label),
+    )];
+    if (labels.length) toast(`Rilevato: ${labels.join(", ")}`, { id: TOAST_SAVED });
   }
 
   async function loadSaved(summary) {
@@ -4818,11 +3947,8 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     toast.dismiss(TOAST_SAVED_MANY);
   }
 
-  /** Adds a strip picture of a classifier match as one more training view of
-   * the SAME classifier -- the object equivalent of "Aggiungi a questa
-   * persona" for a recognised face. Only offered when the entry's box carries
-   * an object_id (see _save() in server_fastapi.py): a plain YOLO class has
-   * none, because there is no classifier to reinforce. */
+  /** Adds a classifier detection to its training views. Only offered when the
+   * entry's box carries an object_id. */
   async function addSavedToClassifier(entry, objectIdOverride) {
     // The picker's choice wins; falling back to the classifier that matched
     // keeps the one-press case for a hit that already belongs somewhere.
@@ -4875,10 +4001,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     }
   }
 
-  /** A new classifier whose first photograph is this one -- the object twin of
-   *  saving a new person from a face in the strip. Two calls because that is
-   *  what the server offers: create, then add the view. If the second fails the
-   *  classifier stays, empty, which is recoverable; the reverse would not be. */
+  /** Creates a classifier from this picture, then adds it as its first view. */
   async function createClassifierFromSaved(entry, name) {
     if (!name || creatingClassifier) return;
     setCreatingClassifier(true);
@@ -4907,9 +4030,8 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     }
   }
 
-  /** Opens the classifier's own panel on this picture's classifier -- the twin
-   *  of "Dettagli" on a recognised person. piOpen is the panel that holds
-   *  "Foto di un oggetto" and "Misura", which is where the box gets drawn. */
+  /** Opens the classifier's panel, where its photos and measurement controls
+   * live. */
   function openClassifierDetails(objectId) {
     if (!objectId) return;
     setEnlargedEntry(null);
@@ -4918,7 +4040,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     setPiOpen(true);
   }
 
-  /** An entry's picture as base64, the form the face endpoints take. */
+  /** Reads a saved picture as base64 for the classifier view endpoint. */
   async function savedBase64(entry) {
     const response = await fetch(savedImageUrl(entry), SEND_COOKIE);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -4931,217 +4053,28 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     });
   }
 
-  /** A thumbnail was clicked. A face opens the save form (unknown) or the edit
-   * form (recognised); a hand or an object opens bigger. */
-  async function openSaved(entry) {
-    if (entry.kind !== "face") {
-      setEnlargedEntry(entry);
-      return;
-    }
-    let image;
-    try {
-      image = await savedBase64(entry);
-    } catch {
-      toast.error("Immagine non disponibile.", { id: TOAST_FACES });
-      return;
-    }
-    // Also brings the judge colours the form offers.
-    const facesData = await loadFaces();
-    if (entry.person_id) {
-      const person = (facesData?.people ?? []).find(
-        (p) => p.id === entry.person_id,
-      );
-      if (!person) {
-        toast.error("Questa persona non e' piu' salvata.", { id: TOAST_FACES });
-        return;
-      }
-      setStripFaceImage(image);
-      stripEntryRef.current = entry;
-      setEnrollPerson(person);
-      setEnrollPreview(image);
-      enrollImagesRef.current = [];
-      setEnrollOpen(true);
-      return;
-    }
-    setStripFaceImage(image);
-    stripEntryRef.current = entry;
-    await openEnrolFor([image], image);
+  /** A thumbnail was clicked. */
+  function openSaved(entry) {
+    setEnlargedEntry(entry);
   }
 
-  // The form's extra buttons, when it was opened from the strip.
-  async function addStripViewTo(personId) {
-    if (!stripFaceImage) return;
-    const entry = stripEntryRef.current;
-    const updated = await addViewToSelected(
-      personId,
-      [stripFaceImage],
-      entry?.id,
+  function handleDetectionError(detail) {
+    detectPendingRef.current = null;
+    setDetectPending(null);
+    setDetectionReady(false);
+    setTextReading(false);
+    setDetectOn(false);
+    setDetectOnlyOn(false);
+    setTextOn(false);
+    textBoxesRef.current = null;
+    overlayRef.current
+      ?.getContext("2d")
+      ?.clearRect(0, 0, overlayRef.current.width, overlayRef.current.height);
+    toast.error(
+      detailText(detail) ??
+        "Rilevamento non riuscito. Controlla la configurazione e i log del server.",
+      { id: TOAST_DETECT, duration: Infinity },
     );
-    // Closed on success: the count on the button would otherwise be stale.
-    if (updated) {
-      setEnrollOpen(false);
-      if (entry) deleteSaved(entry); // saved: it leaves the strip
-    }
-  }
-
-  function pickPersonForStrip() {
-    if (!stripFaceImage) return;
-    setEnrollOpen(false);
-    pickImagesRef.current = [stripFaceImage];
-    setPickValue(null);
-    setPickOpen(true);
-  }
-
-  useEffect(() => {
-    if (faceMode) loadFaces();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [faceMode]);
-
-  // Copies the little the interface needs out of the animation loop's refs,
-  // twice a second. Everything here could be read straight from the ref inside
-  // tick(), and doing so would re-render the page 30 times a second.
-  useEffect(() => {
-    if (!faceMode) {
-      setSelectedFace(null);
-      setFaceCount(0);
-      return;
-    }
-    const timer = setInterval(() => {
-      const detections = faceDetectionsRef.current ?? [];
-      setFaceCount(detections.length);
-      const wanted = selectedTrackRef.current;
-      // Exactly one face on screen selects itself: tapping is for choosing
-      // between several, and it should not be a chore when there is no choice.
-      if (wanted == null && detections.length === 1) {
-        setSelectedTrack(detections[0].trackId);
-        setSelectedFace(detections[0]);
-        return;
-      }
-      const found = detections.find((d) => d.trackId === wanted) ?? null;
-      if (found) {
-        lastSeenRef.current = performance.now();
-        // Only when something the panel actually shows has changed. This runs
-        // five times a second now, and handing React a new object each time
-        // would re-render the page five times a second to display the same
-        // words.
-        setSelectedFace((current) =>
-          panelSignature(current) === panelSignature(found) ? current : found,
-        );
-      } else if (
-        performance.now() - lastSeenRef.current >
-        FACE_SELECTION_GRACE_MS
-      ) {
-        // Only clear the panel once the face has really been gone for a
-        // moment. Clearing it on the first missed frame is what made the save
-        // button flicker away while it was being reached for -- and the
-        // actions re-resolve the live track when they run (liveSelection), so
-        // a slightly stale panel cannot act on the wrong person.
-        setSelectedFace(null);
-      }
-      // Drop a selection whose track is gone for good, so the panel does not
-      // keep offering actions on somebody who left the room.
-      if (wanted != null && !found && !trackerRef.current.has(wanted)) {
-        setSelectedTrack(null);
-      }
-      // Twice a second was chosen to keep setState out of the animation loop,
-      // and it also put up to half a second between a name arriving and the
-      // panel showing it. Five times a second is still nowhere near the frame
-      // rate, and panelSignature above means an unchanged panel costs nothing.
-    }, 200);
-    return () => clearInterval(timer);
-  }, [faceMode]);
-
-  // Leaving face mode throws away the tracks: ids must never be reused, and a
-  // stale selection would point at whoever next takes that id.
-  useEffect(() => {
-    if (faceMode) return;
-    trackerRef.current.reset();
-    faceDetectionsRef.current = [];
-    recogMetaRef.current.clear();
-    cropBufferRef.current.clear();
-    setSelectedTrack(null);
-  }, [faceMode]);
-
-  // Recognition runs on its own, continuously.
-  //
-  // It is a scheduler rather than a loop over every face: one request at a
-  // time, because the server holds both models behind a single lock and firing
-  // three at once would only queue them. Faces nobody has identified yet go
-  // first -- that is what someone is waiting to see -- and an identity already
-  // shown is re-checked every few seconds, because a cached name is a
-  // hypothesis about a box, and the person in that box can change.
-  useEffect(() => {
-    if (!faceMode || !detectsHere || !pageVisible || importedVideo) return;
-    let stopped = false;
-
-    const timer = setInterval(() => {
-      if (stopped || recogniseBusyRef.current) return;
-      const detections = faceDetectionsRef.current ?? [];
-      if (!detections.length) return;
-      const now = performance.now();
-
-      let candidate = null;
-      let bestWait = 0;
-      for (const detection of detections) {
-        // Too far away to identify: the server would only answer "too_small",
-        // so do not spend a round trip discovering that again and again.
-        //
-        // A width of 0 means we could not measure it (the <img> has not
-        // reported its natural size yet), NOT that the face is tiny. Skipping
-        // on that would stop recognition ever running, silently, with no error
-        // anywhere -- so an unmeasurable face is tried rather than skipped.
-        const width = sourceFaceWidth(detection);
-        if (width && width < minFacePxRef.current) continue;
-        const meta = recogMetaRef.current.get(detection.trackId);
-        const identified = detection.identity?.status === "match";
-        const due = identified ? FACE_REVERIFY_MS : FACE_RETRY_MS;
-        const waited = now - (meta?.lastAt ?? 0);
-        if (waited < due) continue;
-        // Unidentified faces outrank identified ones regardless of how long
-        // each has waited.
-        const priority = identified ? waited : waited + 1e6;
-        if (priority > bestWait) {
-          bestWait = priority;
-          candidate = detection;
-        }
-      }
-      if (candidate) recogniseTrack(candidate);
-      // Polled often, because half of it is dead time: a face that appears
-      // just after a tick used to wait most of a second before anyone asked
-      // who it was. The work inside is a walk over at most a handful of boxes.
-    }, 200);
-
-    return () => {
-      stopped = true;
-      clearInterval(timer);
-    };
-  }, [faceMode, detectsHere, pageVisible, capturesOwnCamera, importedVideo]);
-
-  /** Grabs `count` crops of one face, `gapMs` apart, for averaging.
-   *
-   * The gap matters more for enrolling than for recognising. Recognition wants
-   * a quick answer and the frames only have to average out motion blur, so they
-   * are taken close together. Enrolment is stored for ever, and five frames
-   * from the same half-second are five copies of ONE pose -- which is what
-   * makes a record that only matches you when you sit exactly as you did when
-   * you saved it. Spreading them out catches a little real variation.
-   */
-  async function captureCrops(detection, count = 3, gapMs = 120) {
-    const media = currentMediaElement();
-    const crops = [];
-    for (let i = 0; i < count; i++) {
-      // Re-read the box each time: the person moves between captures, and a
-      // stale box would crop the wall next to them.
-      const live =
-        faceDetectionsRef.current.find(
-          (d) => d.trackId === detection.trackId,
-        ) ?? detection;
-      const crop = cropFaceToJpeg(media, live.bbox, faceDetectWidthRef.current);
-      if (crop) crops.push(crop);
-      if (i < count - 1)
-        await new Promise((resolve) => setTimeout(resolve, gapMs));
-    }
-    return crops;
   }
 
   /** The text finder's boxes for the Pi's webcam, which arrive over
@@ -5235,627 +4168,128 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
     setReadOpen(true);
   }
 
-  function handleOverlayPointerDown(event) {
-    if (!faceMode) return;
-    const canvas = overlayRef.current;
-    const point = pointerToCanvas(
-      canvas,
-      event.clientX,
-      event.clientY,
-      videoFit,
-    );
-    if (!point) return;
-    const hit = detectionAt(faceDetectionsRef.current, point.x, point.y);
-    // Tapping the picture away from any face clears the selection, which is
-    // the obvious way to undo a wrong tap.
-    setSelectedTrack(hit ? hit.trackId : null);
-    setSelectedFace(hit ?? null);
-  }
-
-  /** The selected face as it is RIGHT NOW, not as it was when React last
-   * rendered. Tracks expire after a second, so anything that takes a while --
-   * filling in the enrolment form, most obviously -- can easily outlive the
-   * track id it started with, and acting on the stale one silently does
-   * nothing. */
-  function liveSelection() {
-    const detections = faceDetectionsRef.current ?? [];
-    return (
-      detections.find((d) => d.trackId === selectedTrackRef.current) ??
-      (detections.length === 1 ? detections[0] : null)
-    );
-  }
-
-  /** Face width in the SOURCE picture's own pixels, which is what the server
-   * measures against. The boxes are in detect space, which is a different
-   * number, and refusing on the wrong one would refuse the wrong faces. */
-  function sourceFaceWidth(detection) {
-    const media = currentMediaElement();
-    const natural = media?.naturalWidth || media?.videoWidth || 0;
-    const detectWidth = faceDetectWidthRef.current || 1;
-    if (!natural) return 0;
-    return (detection.bbox[2] - detection.bbox[0]) * (natural / detectWidth);
-  }
-
-  /** Keeps the crops a recognition just used, WITH the face size they were
-   * taken at.
-   *
-   * The size is the point. Enrolment refuses a face under 40 px, and the check
-   * has to be made against the pictures actually being sent -- which can be
-   * seconds old -- not against the face on screen when the button was pressed.
-   * Walking towards someone and then saving them used to open the form on a
-   * 90 px face and submit 40 px ones. */
-  function rememberCrops(trackId, images, facePx) {
-    if (!images.length) return;
-    const now = performance.now();
-    const buffer = cropBufferRef.current.get(trackId) ?? [];
-    for (const image of images) buffer.push({ at: now, image, facePx });
-    const fresh = buffer
-      .filter((entry) => now - entry.at < CROP_BUFFER_MS)
-      .slice(-CROP_BUFFER_SIZE);
-    cropBufferRef.current.set(trackId, fresh);
-  }
-
-  /**
-   * Asks the server who this face is, and records the answer against the track.
-   *
-   * A name is only shown once FACE_CONFIRMATIONS answers in a row have named
-   * the SAME person. One frame at an awkward angle can cross the threshold on
-   * its own; two in a row agreeing on the same wrong person is far less likely,
-   * and the cost is about a second before the name appears.
-   */
-  async function recogniseTrack(detection) {
-    if (recogniseBusyRef.current) return;
-    recogniseBusyRef.current = true;
-    try {
-      // The FIRST question about a face is asked with one frame, not three.
-      //
-      // Three crops cost 240 ms of waiting between them and 600 ms on the
-      // server instead of 220 -- most of a second, spent before anybody knows
-      // whether the answer was ever in doubt. Averaging exists for motion
-      // blur, and a blurred single frame simply scores too low to confirm on
-      // its own (it needs FACE_STRONG_SCORE), so it falls back to the vote and
-      // the next check uses three. Speed when the picture is good, caution
-      // when it is not.
-      const previous = recogMetaRef.current.get(detection.trackId);
-      const known = !!previous?.votes?.length;
-      // Booked at the moment the question is asked, not when it is answered.
-      // Otherwise the tick loop below, which fires as soon as it sees a face
-      // with no entry here, would ask again on the very next frame.
-      recogMetaRef.current.set(detection.trackId, {
-        votes: previous?.votes ?? [],
-        lastAt: performance.now(),
-      });
-      const images = await captureCrops(detection, known ? 3 : 1);
-      if (!images.length) return;
-      rememberCrops(
-        detection.trackId,
-        images,
-        Math.round(sourceFaceWidth(detection)),
-      );
-      const response = await fetch(`${API_BASE}/faces/recognize`, {
-        method: "POST",
-        headers: jsonHeaders(),
-        ...SEND_COOKIE,
-        body: JSON.stringify({ images }),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        // This runs every couple of seconds, so a toast per failure would
-        // stack up a wall of them. Only the one a user can act on is shown,
-        // and it reuses a fixed id so repeats replace rather than pile up.
-        if (response.status === 503) {
-          toast.error(
-            detailText(data.detail) ?? "Riconoscimento non disponibile.",
-            {
-              id: TOAST_FACES,
-            },
-          );
-        }
-        return;
-      }
-
-      let target = detection.trackId;
-      let inherited = null;
-      if (!trackerRef.current.has(target)) {
-        // The track died while we were asking -- ordinary, since tracks live a
-        // second and a round trip can take longer. Re-homing the answer is only
-        // safe when exactly ONE face is on screen; with several, the face we
-        // asked about may not be the one still here, and a name on the wrong
-        // box is the failure this whole design exists to avoid.
-        const live = faceDetectionsRef.current ?? [];
-        if (live.length !== 1) return;
-        // The votes move with the answer. Without this the re-homed answer
-        // lands on a track with an empty history and counts as the first of
-        // two all over again -- which, with a box that breaks and reforms every
-        // second or so, means a second vote never arrives and nobody is ever
-        // named. It is the same single face on screen either way.
-        inherited = recogMetaRef.current.get(target)?.votes ?? null;
-        recogMetaRef.current.delete(target);
-        target = live[0].trackId;
-      }
-
-      const meta = recogMetaRef.current.get(target) ?? {
-        votes: inherited ?? [],
-        lastAt: 0,
-      };
-      meta.votes.push(
-        data.status === "match" ? (data.person?.id ?? null) : null,
-      );
-      meta.votes = meta.votes.slice(-FACE_VOTE_WINDOW);
-      meta.lastAt = performance.now();
-      recogMetaRef.current.set(target, meta);
-
-      // Who, if anyone, has been named enough times in the recent answers.
-      const tally = new Map();
-      for (const vote of meta.votes) {
-        if (vote) tally.set(vote, (tally.get(vote) ?? 0) + 1);
-      }
-      let confirmedId = null;
-      for (const [id, count] of tally) {
-        if (count >= FACE_CONFIRMATIONS) confirmedId = id;
-      }
-      // One decisive answer is enough on its own. Waiting for a second assumes
-      // the face will still be there to give one, and with a moving camera it
-      // often is not.
-      if (
-        !confirmedId &&
-        data.status === "match" &&
-        data.score >= FACE_STRONG_SCORE &&
-        data.score - (data.runner_up ?? 0) >= FACE_STRONG_MARGIN
-      ) {
-        confirmedId = data.person?.id ?? null;
-      }
-
-      let identity;
-      if (
-        confirmedId &&
-        data.status === "match" &&
-        data.person?.id === confirmedId
-      ) {
-        identity = data;
-      } else if (confirmedId) {
-        // Confirmed a moment ago, and this one answer disagrees. Keep the name.
-        // A person who turns their head scores badly for a frame or two, and
-        // blanking the label every time they do makes the whole feature look
-        // broken. Only a DIFFERENT person reaching confirmation replaces it.
-        identity = trackerRef.current.get(target)?.identity ?? data;
-      } else if (data.status === "match") {
-        // Named once, not yet often enough to show.
-        identity = {
-          ...data,
-          status: "checking",
-          maybe: data.person,
-          person: null,
-        };
-      } else {
-        identity = data;
-      }
-
-      trackerRef.current.setIdentity(target, identity);
-      setSelectedFace((current) =>
-        current && current.trackId === target
-          ? { ...current, identity }
-          : current,
-      );
-    } catch {
-      // A dropped request is ordinary here -- the next scheduled check is a
-      // couple of seconds away, and the box simply stays unidentified.
-    } finally {
-      recogniseBusyRef.current = false;
-    }
-  }
-
-  /**
-   * Adds the current view of a face to a person already enrolled.
-   *
-   * This is the way out of a contradiction the app had: it would advise saving
-   * someone again from another angle, and then refuse the save because that
-   * person is already stored. Both halves were right -- a record built from one
-   * pose does need more views, and a second record for the same person really
-   * would make every later match a coin flip between them. What was missing was
-   * the third option: add the view to the record that exists.
-   *
-   * `stripImages`: pictures from the strip (DetectionStrip) to add instead of
-   * crops of the face selected on the live video. Returns the updated person
-   * on success, null otherwise.
-   */
-  async function addViewToSelected(personId, stripImages, entryId) {
-    const detection = stripImages ? null : liveSelection();
-    const id = personId ?? selectedFace?.identity?.person?.id;
-    if ((!stripImages && !detection) || !id || addingView) return null;
-    setAddingView(true);
-    try {
-      let images = stripImages;
-      if (!images) {
-        const now = performance.now();
-        // Same rule as enrolling, and for the same reason: this endpoint runs
-        // the same size and coherence checks, so stale or small crops fail it.
-        const buffered = (cropBufferRef.current.get(detection.trackId) ?? [])
-          .filter(
-            (entry) =>
-              now - entry.at < ENROL_CROP_MAX_AGE_MS &&
-              (!entry.facePx || entry.facePx >= enrolMinFacePx),
-          )
-          .map((entry) => entry.image);
-        const wanted = Math.max(0, 3 - buffered.length);
-        const fresh = wanted ? await captureCrops(detection, wanted, 350) : [];
-        images = [...buffered, ...fresh].slice(-3);
-      }
-      if (!images.length) {
-        toast.error("Non sono riuscito a ritagliare il volto.", {
-          id: TOAST_FACES,
-        });
-        return null;
-      }
-      const response = await fetch(`${API_BASE}/faces/${id}/sample`, {
-        method: "POST",
-        headers: jsonHeaders(),
-        ...SEND_COOKIE,
-        // entry_id: the strip picture, whose position goes with the photo.
-        body: JSON.stringify(
-          entryId ? { images, entry_id: entryId } : { images },
-        ),
-      });
-      const data = await response.json();
-      if (!response.ok) {
-        toast.error(detailText(data.detail) ?? "Non riuscito.", {
-          id: TOAST_FACES,
-        });
-        return null;
-      }
-      toast.success(
-        `Inquadratura aggiunta a ${data.person.name} ${data.person.surname}`.trim() +
-          ` (${data.person.samples} in tutto).`,
-        { id: TOAST_FACES },
-      );
-      // Force the next scheduled check to use the widened record rather than
-      // whatever it concluded before -- including its stored "unknown" votes,
-      // which is the whole point of having added a view.
-      if (detection) {
-        recogMetaRef.current.delete(detection.trackId);
-        trackerRef.current.setIdentity(detection.trackId, null);
-      }
-      loadFaces();
-      return data.person;
-    } catch (error) {
-      toast.error(`Non riuscito: ${error.message}`, { id: TOAST_FACES });
-      return null;
-    } finally {
-      setAddingView(false);
-    }
-  }
-
-  async function startEnrol() {
-    const detection = liveSelection();
-    if (!detection) return;
-    setStripFaceImage(null);
-    stripEntryRef.current = null;
-
-    // Refuse before asking for a name, not after. The server enforces the same
-    // floor, but discovering it on submit means typing everything in and then
-    // being told the picture was never good enough.
-    const facePx = Math.round(sourceFaceWidth(detection));
-    if (facePx && facePx < enrolMinFacePx) {
-      toast.error(
-        `Il volto è troppo piccolo per essere salvato (${facePx} px, ` +
-          `ne servono ${enrolMinFacePx}). Avvicinati e riprova.`,
-        { id: TOAST_FACES },
-      );
-      return;
-    }
-
-    // Frames from BEFORE the click, kept by the recogniser as it worked. The
-    // moment worth saving is the one that was on screen when the button was
-    // pressed -- capturing only afterwards saves a pose from seconds later,
-    // which is not what anyone chose.
-    //
-    // Only RECENT ones, and only ones big enough for the server to accept: an
-    // eight-second-old crop is a different distance and often a different
-    // pose, which is what made the server answer either "too small" or "not
-    // the same person" about a burst of one person standing still.
-    const now = performance.now();
-    const buffered = (cropBufferRef.current.get(detection.trackId) ?? [])
-      .filter(
-        (entry) =>
-          now - entry.at < ENROL_CROP_MAX_AGE_MS &&
-          (!entry.facePx || entry.facePx >= enrolMinFacePx),
-      )
-      .map((entry) => entry.image);
-
-    // Top up to five with fresh ones, spread out: five frames from one instant
-    // are one pose recorded five times, and a record made of those only
-    // recognises the person sitting exactly as they were.
-    const wanted = Math.max(0, 5 - buffered.length);
-    const fresh = wanted ? await captureCrops(detection, wanted, 400) : [];
-    const images = [...buffered, ...fresh].slice(-5);
-    if (!images.length) {
-      toast.error("Non sono riuscito a ritagliare il volto.", {
-        id: TOAST_FACES,
-      });
-      return;
-    }
-    // Measured again after capturing, because capturing took two seconds and
-    // the person may have stepped back during them. Better a toast now than a
-    // filled-in form thrown away on submit.
-    const afterPx = Math.round(sourceFaceWidth(liveSelection() ?? detection));
-    if (afterPx && afterPx < enrolMinFacePx) {
-      toast.error(
-        `Il volto è troppo piccolo per essere salvato (${afterPx} px, ` +
-          `ne servono ${enrolMinFacePx}). Avvicinati e riprova.`,
-        { id: TOAST_FACES },
-      );
-      return;
-    }
-    // The newest buffered frame is the one closest to the moment of the click.
-    await openEnrolFor(
-      images,
-      buffered.length ? buffered[buffered.length - 1] : images[0],
-    );
-  }
-
-  /** Opens the save form for these face pictures, once the server has said it
-   * would accept them. Shared by the live video (startEnrol) and the strip. */
-  async function openEnrolFor(images, preview) {
-    // Ask the server whether it would accept these pictures, BEFORE asking the
-    // user for a name.
-    //
-    // The local checks above only know how wide the box is. "Nitido e
-    // frontale" is YuNet's score on the submitted crop, and YuNet runs on the
-    // server -- so a blurred or three-quarter face passed everything here and
-    // was refused after the form had been filled in. This sends the exact
-    // images the form would submit, through the exact filter that would judge
-    // them, so the form opens only when saving will work.
-    setSavingFace(true);
-    let verdict;
-    try {
-      const response = await fetch(`${API_BASE}/faces/check`, {
-        method: "POST",
-        headers: jsonHeaders(),
-        ...SEND_COOKIE,
-        body: JSON.stringify({ images }),
-      });
-      verdict = await response.json();
-      if (!response.ok) {
-        toast.error(detailText(verdict.detail) ?? "Controllo non riuscito.", {
-          id: TOAST_FACES,
-        });
-        return;
-      }
-    } catch {
-      toast.error("Server non raggiungibile.", { id: TOAST_FACES });
-      return;
-    } finally {
-      setSavingFace(false);
-    }
-    if (!verdict.ok) {
-      toast.error(verdict.error, { id: TOAST_FACES });
-      return;
-    }
-
-    setEnrollPerson(null);
-    setEnrollPreview(preview);
-    enrollImagesRef.current = images;
-    setEnrollOpen(true);
-  }
-
-  function startEdit() {
-    const person = selectedFace?.identity?.person;
-    if (!person) return;
-    setStripFaceImage(null);
-    stripEntryRef.current = null;
-    setEnrollPerson(person);
-    setEnrollPreview(null);
-    enrollImagesRef.current = [];
-    setEnrollOpen(true);
-  }
-
-  async function submitEnrol(fields) {
-    // Read now: the form closes (and may be reopened) before the answer comes.
-    const fromStrip = stripFaceImage ? stripEntryRef.current : null;
-    setSavingFace(true);
-    try {
-      const editing = Boolean(enrollPerson);
-      const response = await fetch(
-        editing ? `${API_BASE}/faces/${enrollPerson.id}` : `${API_BASE}/faces`,
-        {
-          method: editing ? "PATCH" : "POST",
-          headers: jsonHeaders(),
-          ...SEND_COOKIE,
-          body: JSON.stringify(
-            editing
-              ? {
-                  name: fields.name,
-                  surname: fields.surname,
-                  description: fields.description,
-                  judge: fields.judge,
-                }
-              : {
-                  ...fields,
-                  images: enrollImagesRef.current,
-                  ...(fromStrip ? { entry_id: fromStrip.id } : {}),
-                },
-          ),
-        },
-      );
-      const data = await response.json();
-      if (!response.ok) {
-        const known = data.detail?.person;
-        if (response.status === 409 && known) {
-          // Refusing a duplicate is right, but leaving it at a refusal is what
-          // made the app contradict itself: it asks for another angle, then
-          // rejects the attempt. Offer what was actually wanted instead.
-          setEnrollOpen(false);
-          toast.error(detailText(data.detail), {
-            id: TOAST_FACES,
-            duration: 14000,
-            action: {
-              label: "Aggiungi a questa persona",
-              // From the strip there is no face selected on the video: the
-              // picture the form was about to save is the one to add.
-              onClick: async () => {
-                const updated = await addViewToSelected(
-                  known.id,
-                  fromStrip ? enrollImagesRef.current : undefined,
-                  fromStrip?.id,
-                );
-                if (updated && fromStrip) deleteSaved(fromStrip); // saved: it leaves the strip
-              },
-            },
-            // Only a resemblance can be overridden. A confident duplicate
-            // stays refused: a second record for the same face stops BOTH
-            // from being recognised.
-            cancel: data.detail?.certain
-              ? undefined
-              : {
-                  label: "È un'altra persona",
-                  onClick: () =>
-                    submitEnrol({ ...fields, allow_similar: true }),
-                },
-          });
-          return;
-        }
-        toast.error(detailText(data.detail) ?? "Salvataggio non riuscito.", {
-          id: TOAST_FACES,
-        });
-        return;
-      }
-      setEnrollOpen(false);
-      // Its picture is now the person's: it leaves the strip. Only for a new
-      // person -- editing a name does not save the picture.
-      if (fromStrip && !editing) deleteSaved(fromStrip);
-      const saved = `${data.person.name} ${data.person.surname}`.trim();
-      if (editing) {
-        toast.success("Modifiche salvate.", { id: TOAST_FACES });
-      } else if ((data.person.samples ?? 0) < 2) {
-        // Near-identical frames are discarded, so a count of one means every
-        // frame caught the same instant. Saying so matters: such a record only
-        // recognises this person in this exact pose, and nothing else about
-        // the interface would reveal that.
-        toast.warning(
-          `${saved} salvato, ma con una sola inquadratura utile. ` +
-            "Girati un poco e usa «Aggiungi inquadratura» per riconoscerlo meglio.",
-          { id: TOAST_FACES, duration: 10000 },
-        );
-      } else {
-        toast.success(
-          `${saved} salvato (${data.person.samples} inquadrature).`,
-          {
-            id: TOAST_FACES,
-          },
-        );
-      }
-      // Recognise again straight away rather than waiting for the scheduler,
-      // so the box takes its colour the moment the record exists.
-      //
-      // Deliberately re-recognising instead of attaching the person we just
-      // saved to the selected track: filling in the form takes far longer than
-      // the one second a track lives, so the face on screen is almost always a
-      // NEW track by now, and attaching to the old id quietly did nothing --
-      // the record saved correctly and the box stayed grey.
-      //
-      // The votes for the current track are cleared first, so the fresh answers
-      // are not weighed against the "unknown" ones from before the save.
-      loadFaces();
-      const current = liveSelection();
-      if (current) {
-        recogMetaRef.current.delete(current.trackId);
-        await recogniseTrack(current);
-      }
-    } catch (error) {
-      toast.error(`Salvataggio non riuscito: ${error.message}`, {
-        id: TOAST_FACES,
-      });
-    } finally {
-      setSavingFace(false);
-    }
-  }
-
-  // This device's own camera as the source, and "Condividi con gli altri" --
-  // shown in the right panel, "Questo dispositivo". A JSX value of its own
-  // rather than inlined there because it was also shown a second time in the
-  // left "Server" panel for a while; that was dropped (it read as a
-  // duplicate on the machine running the server, where both panels are the
-  // same device), but kept as its own value in case a reason to show it
-  // somewhere else comes up again.
-  const thisDeviceFieldset = (
-    <Fieldset variant="filled" radius="md" p="xs" legend="Questo dispositivo">
-      <Stack gap="xs">
-        {/* Streams the camera of whatever device is viewing this page (phone,
-            tablet, laptop) up to the server -- the machine running the server
-            included: its own webcam through the browser is the same
-            own-camera path as a phone's, with the same detection, saving and
-            Avvia/Ferma. It used to be disabled here, with a note pointing at
-            the "Webcam N" buttons instead -- that separate, much thinner path
-            is still there, but is no longer the only way in. */}
-        {/* NOT on the machine that runs the server. There this device's camera
-            is the Raspberry's own webcam, which the left panel already starts
-            and stops ("Condividi la webcam"), and showing a second sharing
-            button for the same camera read as a duplicate. A phone or a PC keeps
-            both: its own camera here, the Pi's webcam on the left. */}
-        {!clientIsServer && (
-          <>
+  const deviceCameraFieldset = (
+    <Fieldset
+      variant="filled"
+      radius="md"
+      p="xs"
+      legend="Videocamere di questo dispositivo"
+    >
+      {clientIsServer ? (
+        <Stack gap="xs">
+          {(usbDevices ?? []).map((index) => (
             <Button
-              variant={source === "remote" ? "filled" : "light"}
-              onClick={() => {
-                if (wideScreen !== true) setAppOpen(false);
-                selectSource("remote");
-              }}
+              key={index}
+              variant={shownWebcam.source === "usb" && shownWebcam.index === index ? "filled" : "outline"}
+              color={shownWebcam.source === "usb" && shownWebcam.index === index ? "teal" : "gray"}
+              leftSection={
+                shownWebcam.source === "usb" && shownWebcam.index === index ? (
+                  <span aria-hidden="true">✓</span>
+                ) : null
+              }
+              aria-pressed={shownWebcam.source === "usb" && shownWebcam.index === index}
+              onClick={() => pickWebcam("usb", index)}
               disabled={switching}
-              title="La fotocamera del telefono o del PC che sta guardando questa pagina"
+              title={
+                serverIsPi
+                  ? `Videocamera collegata al server, /dev/video${index}`
+                  : `Videocamera del server, indice ${index}. Su Windows puo' essere integrata.`
+              }
             >
-              Fotocamera di questo dispositivo
+              {serverIsPi ? `Webcam USB ${index}` : `Webcam ${index}`}
             </Button>
-            {/* Only meaningful for this device's own camera. The Raspberry's
-              cameras have nothing to switch off: their frames start on the
-              Pi, so the stream to the browser IS the video. */}
-            {/* Only offered when nobody else owns the stream -- which is
-              already what capturesOwnCamera means now. Previously every
-              page showed this button, so any device could start publishing
-              over another, and each of them showed a "stop sharing" button
-              for a stream it did not own. A spectator stops the stream from
-              the device list below instead. */}
-            {capturesOwnCamera && (
-              <Button
-                variant={sharing ? "filled" : "light"}
-                // Room of its own, above and below. It shares a Stack with
-                // the camera button, so widening that Stack's gap would have
-                // spaced the whole group instead of setting this one apart --
-                // and this is the button that starts and stops the thing the
-                // page is for.
-                my="sm"
-                // Closing the panel is part of the action, not a nicety: what
-                // you want to see the instant you start sharing is the
-                // picture you are sending, and this panel is covering it.
-                // The floating button over the video is how you stop again,
-                // so nothing becomes unreachable by closing this.
-                onClick={() => {
-                  setSharing((on) => !on);
-                  setPiOpen(false);
-                }}
-                disabled={switching}
-                /* Same correction as the group label above: seen from a phone
-                 pointed at a Windows PC, "al Raspberry" names a machine
-                 that is not involved. */
-                title={
-                  sharing
-                    ? `Smetti di inviare il video ${serverIsPi ? "al Raspberry" : "al server"}`
-                    : `Invia il video ${serverIsPi ? "al Raspberry" : "al server"} perche' gli altri dispositivi possano vederlo`
-                }
-              >
-                {sharing ? "Smetti di condividere" : "Condividi con gli altri"}
-              </Button>
-            )}
-          </>
-        )}
-      </Stack>
+          ))}
+          <Button
+            type="button"
+            variant="filled"
+            color="blue"
+            mt="sm"
+            onClick={scanUsbDevices}
+            loading={scanning}
+          >
+            {scanning ? "Ricerca in corso..." : "Cerca videocamere"}
+          </Button>
+          <Button
+            type="button"
+            variant="filled"
+            color={webcamOn && cameraShared ? "red" : "green"}
+            onClick={toggleWebcam}
+            disabled={switching || someoneElseShares}
+            title={
+              someoneElseShares
+                ? "Un altro dispositivo sta condividendo la sua fotocamera"
+                : webcamOn && cameraShared
+                  ? "Gli altri dispositivi non la vedranno piu'; qui resta accesa"
+                  : "Avvia la videocamera scelta e, solo su richiesta, la mostra agli altri dispositivi"
+            }
+          >
+            {webcamOn && cameraShared
+              ? "Smetti di condividere"
+              : "Condividi la webcam"}
+          </Button>
+        </Stack>
+      ) : (
+        <Stack gap="xs">
+          {localVideoDevices.some((device) => device.deviceId) && (
+            <Select
+              label="Videocamera"
+              data={localVideoDevices
+                .filter((device) => device.deviceId)
+                .map((device) => ({
+                  value: device.deviceId,
+                  label: device.label,
+                }))}
+              value={selectedLocalDeviceId || null}
+              onChange={(value) => {
+                if (!value) return;
+                setSelectedLocalDeviceId(value);
+                setLocalCameraPreview(true);
+                setAppOpen(false);
+              }}
+              disabled={switching || localDeviceScanning || someoneElseShares}
+              description="La selezione mostra la camera in anteprima su questo dispositivo; non avvia la condivisione."
+              comboboxProps={darkDropdown}
+            />
+          )}
+          <Button
+            type="button"
+            variant="filled"
+            color="blue"
+            onClick={() => scanLocalVideoDevices(true)}
+            loading={localDeviceScanning}
+          >
+            {localDeviceScanning ? "Ricerca in corso..." : "Cerca videocamere"}
+          </Button>
+          {(capturesOwnCamera || (localCameraPreview && !clientIsServer)) && (
+            <Button
+              variant={sharing ? "filled" : "light"}
+              my="sm"
+              onClick={toggleClientSharing}
+              disabled={switching || someoneElseShares}
+              title={
+                sharing
+                  ? "Smetti di inviare il video al server"
+                  : "Invia il video al server perche' gli altri dispositivi possano vederlo"
+              }
+            >
+              {sharing ? "Smetti di condividere" : "Condividi con gli altri"}
+            </Button>
+          )}
+        </Stack>
+      )}
+    </Fieldset>
+  );
+
+  const connectedDevicesFieldset = (
+    <Fieldset
+      variant="filled"
+      radius="md"
+      p="xs"
+      legend="Dispositivi collegati"
+    >
       {/* Who is connected, and who owns the stream. Without this there
           was no way to tell whether the video came from this device or
-          another, nor why the sharing button was unavailable.
-
-          Mantine's List, so the bullets, the indent and the hanging
-          indent of a wrapped line all come from the library rather than
-          from a hand-made row. Without them several devices ran together
-          into one block of text with nothing marking where one ended. */}
+          another, nor why the sharing button was unavailable. */}
       <List size="sm" spacing="xs" className="mt-1.5" listStyleType="disc">
         {deviceList.length === 0 && (
           <Text size="sm" c="dimmed">
@@ -5906,7 +4340,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         >
           {sharing
             ? "Visibile agli altri dispositivi. Il rilevamento gira solo qui: gli altri vedono il video senza riquadri."
-            : "Solo su questo dispositivo. La fotocamera e il rilevamento funzionano, ma nulla viene inviato al Raspberry."}
+            : "Solo su questo dispositivo. La fotocamera e il rilevamento funzionano, ma nulla viene inviato al server."}
         </Text>
       )}
       {/* The spectator's side of the same story: this page shows someone
@@ -5952,10 +4386,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
           breakpoint: "md",
           collapsed: { mobile: !appOpen, desktop: !appOpen },
         }}
-        // Sized for the longest label, not the average one. On a 390 px phone
-        // the secondary slot is 101 px wide and "Aggiungi a una persona…" wraps
-        // inside it; at 128 px the bar was clipped and the last word was cut in
-        // half. Measured at 164: 106 px of content, nothing clipped.
+        // Sized for the longest label, not the average one.
         //
         // `offset: false` is what makes this bar FLOAT. Mantine then never
         // defines --app-shell-footer-offset, and two things follow from that one
@@ -5970,13 +4401,8 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         footer={{
           // Nothing left to show -- the detection label moved to the top bar --
           // and the bar is removed, so the picture gets the space.
-          height:
-            faceMode && detectsHere
-              ? { base: 164, sm: 124 }
-              : someoneElseShares
-                ? 52
-                : 0,
-          collapsed: !(faceMode && detectsHere) && !someoneElseShares,
+          height: someoneElseShares ? 52 : 0,
+          collapsed: !someoneElseShares,
           offset: false,
         }}
         padding={0}
@@ -6022,7 +4448,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                 if (!piOpen && wideScreen !== true) setAppOpen(false);
                 setPiOpen((open) => !open);
               }}
-              label={serverIsPi ? "Raspberry" : "Server"}
+              label="Server"
             />
             {/* Its own backing too: white-on-white is unreadable the moment the
               camera points at something bright. What is being detected, as
@@ -6051,58 +4477,52 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                 room, the pair under the switch on a phone (a 390 px screen has
                 about 280 px between the two burgers). */}
                 <Group gap={6} wrap="wrap" justify="center" w="100%">
-                  <Tooltip
-                    label="Cosa cercare nell'immagine: oggetti, volti e mani (Avvia e Osserva) oppure il testo (Leggi testo e Osserva testo)."
-                    multiline
-                    w={260}
-                    events={{ hover: true, focus: true, touch: true }}
+                  <InfoControl
+                    text="Scegli se cercare oggetti con il classificatore personalizzato o testo nell'immagine."
+                    onOpen={setInfoMessage}
                   >
-                    <div>
-                      <SegmentedControl
-                        size="sm"
-                        radius="xl"
-                        color="violet"
-                        value={textMode ? "text" : "objects"}
-                        data={[
-                          { value: "objects", label: "Oggetti" },
-                          { value: "text", label: "Testo" },
-                        ]}
-                        onChange={(value) => {
-                          if (value === "objects") {
-                            setTextMode(false);
-                            setTextOn(false);
-                            if (canDetect) {
-                              setDetectionReady(false);
-                              setDetectOnlyOn(true);
-                            }
-                          } else {
-                            setTextMode(true);
-                            setDetectOn(false);
-                            setDetectOnlyOn(false);
-                            if (cameraOn) {
-                              setDetectionReady(false);
-                              setTextOn(true);
-                              setTextSave(false);
-                            }
+                    <SegmentedControl
+                      size="sm"
+                      radius="xl"
+                      color="violet"
+                      value={textMode ? "text" : "objects"}
+                      data={[
+                        { value: "objects", label: "Oggetti" },
+                        { value: "text", label: "Testo" },
+                      ]}
+                      onChange={(value) => {
+                        if (value === "objects") {
+                          setTextMode(false);
+                          setTextOn(false);
+                          if (canDetect) {
+                            setDetectionReady(false);
+                            setDetectOnlyOn(true);
                           }
-                        }}
-                      />
-                    </div>
-                  </Tooltip>
+                        } else {
+                          setTextMode(true);
+                          setDetectOn(false);
+                          setDetectOnlyOn(false);
+                          if (cameraOn) {
+                            setDetectionReady(false);
+                            setTextOn(true);
+                            setTextSave(false);
+                          }
+                        }
+                      }}
+                    />
+                  </InfoControl>
                   <Group gap={6} wrap="nowrap" className="main-actions">
                     {textMode ? (
                       <>
-                        <Tooltip
-                          label={
+                        <InfoControl
+                          text={
                             cameraOn
                               ? textOn && textSave
-                                ? "Interrompe la ricerca del testo. Le immagini gia' salvate restano nella striscia."
-                                : "Cerca il testo nell'immagine in tempo reale e salva nella striscia in basso le inquadrature con testo. Tocca un riquadro per leggerlo. Mentre e' attiva il pulsante diventa « Ferma »."
+                                ? "Interrompe la ricerca del testo. Le immagini gia' salvate restano nel carosello."
+                                : "Legge il testo in tempo reale e salva nel carosello i fotogrammi con testo riconosciuto. Tocca un riquadro per leggere il dettaglio."
                               : "Accendi prima una camera: non c'e' nessuna immagine da leggere."
                           }
-                          multiline
-                          w={260}
-                          events={{ hover: true, focus: true, touch: true }}
+                          onOpen={setInfoMessage}
                         >
                           <div>
                             <Button
@@ -6138,18 +4558,16 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                                 : "Leggi testo"}
                             </Button>
                           </div>
-                        </Tooltip>
-                        <Tooltip
-                          label={
+                        </InfoControl>
+                        <InfoControl
+                          text={
                             cameraOn
                               ? textOn && !textSave
                                 ? "Interrompe la ricerca del testo."
-                                : "Cerca il testo nell'immagine in tempo reale e mostra i riquadri, senza salvare nulla. Tocca un riquadro per leggerlo. Mentre e' attiva il pulsante diventa « Ferma »."
+                                : "Mostra i riquadri e il testo riconosciuto in tempo reale, senza salvare immagini. Tocca un riquadro per leggere il dettaglio."
                               : "Accendi prima una camera: non c'e' nessuna immagine da leggere."
                           }
-                          multiline
-                          w={260}
-                          events={{ hover: true, focus: true, touch: true }}
+                          onOpen={setInfoMessage}
                         >
                           <div>
                             <Button
@@ -6185,13 +4603,11 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                                 : "Osserva testo"}
                             </Button>
                           </div>
-                        </Tooltip>
+                        </InfoControl>
                         {!importedVideo && (
-                          <Tooltip
-                            label="Legge il testo di un'immagine che scegli dal dispositivo, senza usare la camera. Si salva senza posizione."
-                            multiline
-                            w={260}
-                            events={{ hover: true, focus: true, touch: true }}
+                          <InfoControl
+                            text="Legge il testo di un'immagine scelta dal dispositivo, senza usare la camera. Il risultato si salva senza posizione."
+                            onOpen={setInfoMessage}
                           >
                             <div>
                               <FileButton
@@ -6212,24 +4628,22 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                                 )}
                               </FileButton>
                             </div>
-                          </Tooltip>
+                          </InfoControl>
                         )}
                       </>
                     ) : (
                       <>
-                        <Tooltip
-                          label={
+                        <InfoControl
+                          text={
                             !canDetect
                               ? someoneElseShares
                                 ? "Un altro dispositivo sta condividendo la sua fotocamera: qui non c'e' niente da rilevare."
-                                : "Accendi prima una webcam (pannello a sinistra) oppure scegli « Fotocamera di questo dispositivo » (pannello a destra)."
+                                : "Scegli una videocamera dalla sidebar « Questo dispositivo »."
                               : detectOn
-                                ? "Interrompe il rilevamento di oggetti, volti e mani. Le immagini gia' salvate restano nella striscia."
-                                : "Rileva oggetti, volti e mani e salva nella striscia in basso le inquadrature. Mentre e' attivo il pulsante diventa « Ferma »."
+                                ? "Interrompe la ricerca del classificatore. Le immagini gia' salvate restano nel carosello."
+                                : "Rileva l'oggetto con il classificatore selezionato e salva nel carosello le immagini rilevate."
                           }
-                          multiline
-                          w={260}
-                          events={{ hover: true, focus: true, touch: true }}
+                          onOpen={setInfoMessage}
                         >
                           <div>
                             <Button
@@ -6237,7 +4651,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                               size="md"
                               radius="xl"
                               disabled={!canDetect}
-                              color={canDetect && detectOn ? "red" : "green"}
+                              color={canDetect && detectOn ? "red" : "blue"}
                               onClick={() => {
                                 // Starting it is done to LOOK at the result: on a phone
                                 // an open panel covers the video.
@@ -6254,20 +4668,18 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                               {canDetect && detectOn ? "Ferma" : "Avvia"}
                             </Button>
                           </div>
-                        </Tooltip>
-                        <Tooltip
-                          label={
+                        </InfoControl>
+                        <InfoControl
+                          text={
                             !canDetect
                               ? someoneElseShares
                                 ? "Un altro dispositivo sta condividendo la sua fotocamera: qui non c'e' niente da rilevare."
-                                : "Accendi prima una webcam (pannello a sinistra) oppure scegli « Fotocamera di questo dispositivo » (pannello a destra)."
+                                : "Scegli una videocamera dalla sidebar « Questo dispositivo »."
                               : detectOnlyOn
-                                ? "Interrompe il rilevamento di oggetti, volti e mani."
-                                : "Rileva oggetti, volti e mani e mostra i riquadri, senza salvare nulla. Mentre e' attivo il pulsante diventa « Ferma »."
+                                ? "Interrompe il rilevamento del classificatore."
+                                : "Mostra i riquadri e il nome dell'oggetto riconosciuto, senza salvare immagini."
                           }
-                          multiline
-                          w={260}
-                          events={{ hover: true, focus: true, touch: true }}
+                          onOpen={setInfoMessage}
                         >
                           <div>
                             <Button
@@ -6291,7 +4703,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                               {canDetect && detectOnlyOn ? "Ferma" : "Osserva"}
                             </Button>
                           </div>
-                        </Tooltip>
+                        </InfoControl>
                       </>
                     )}
                   </Group>
@@ -6303,14 +4715,15 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                   mt={8}
                   className="absolute left-1/2 top-full w-max min-w-0 max-w-[70vw] -translate-x-1/2 rounded-full bg-black/45 px-2 py-0.5 text-white"
                 >
-                  {detectorStatus ||
-                    (switching
+                  {(switching
                       ? "Cambio sorgente…"
                       : serverSaving && !(serverCamera && detectOn)
-                        ? "Salvataggio attivo dalla webcam del Raspberry"
+                        ? "Salvataggio attivo dalla videocamera del server"
                         : textMode
                           ? "Lettura del testo"
-                          : `Rilevamento: ${currentDetectionLabel}`)}
+                          : currentDetectionLabel
+                            ? `Rilevamento: ${currentDetectionLabel}`
+                            : "Nessun classificatore selezionato")}
                 </Text>
               </div>
             )}
@@ -6337,26 +4750,38 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
           keeps the panels below the header, and the burger reachable. It wins
           without !important because index.css declares `utilities` after
           `mantine`, and a later layer beats an earlier one. */}
-        <AppShell.Main className="flex h-[100svh] pt-0">
+        <AppShell.Main className="flex h-[100svh] bg-[#242424] pt-0">
           {/* Explicitly relative. The overlay's `absolute inset-0` used to work
             only as a side effect of the old container being `sticky`. */}
-          <div className="relative flex-1 min-w-0 bg-[#111]">
+          <div className="relative flex-1 min-w-0 bg-[#242424]">
             {/* Nothing is shared: say so and say how to start, instead of a black
               rectangle that looks like a fault. */}
             {source === "none" &&
               showVideo &&
               !importedVideo &&
-              !localCameraPreview && (
+              !localCameraPreview &&
+              (cameraDiscoveryPending ? (
+                <div className="pointer-events-none absolute inset-x-6 top-1/2 z-10 flex -translate-y-1/2 items-center justify-center gap-2 rounded-md bg-black/75 px-3 py-2">
+                  <Loader size="sm" color="white" />
+                  <Text size="sm" c="white">
+                    Ricerca delle videocamere in corso...
+                  </Text>
+                </div>
+              ) : (
                 <Text
                   size="sm"
                   c="gray.4"
-                  className="pointer-events-none absolute inset-x-6 top-1/2 z-10 -translate-y-1/2 text-center"
+                  className="pointer-events-none absolute inset-x-6 top-1/2 z-10 -translate-y-1/2 rounded-md bg-black/75 px-3 py-2 text-center"
                 >
-                  Nessuna camera accesa. Scegli una webcam (pannello a sinistra)
-                  oppure « Fotocamera di questo dispositivo » (pannello a
-                  destra).
+                  {clientIsServer
+                    ? usbDevices?.length || hasPiCamera
+                      ? "Nessuna videocamera accesa. Scegline una nella sidebar « Questo dispositivo »."
+                      : "Nessuna videocamera trovata su questo dispositivo."
+                    : localVideoDevices.length
+                      ? "Nessuna videocamera accesa. Scegline una nella sidebar « Questo dispositivo »."
+                      : "Nessuna videocamera trovata su questo dispositivo."}
                 </Text>
-              )}
+              ))}
             {/* What to photograph next, on the picture: the instruction is read
               while aiming, not in a panel that covers the video. Under the
               status line, which can run to 70% of the width. Not clickable, so
@@ -6401,15 +4826,11 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                   land a consistent distance from the finger, or captions come
                   out the wrong size.
 
-                  With cover, a 390x844 phone showing a 4:3 camera loses about
-                  65% of the WIDTH, so a face at the edge is not there to tap.
-                  That is the whole reason this is a choice and not a constant.
-
                   w-full h-full are NOT decoration. For an absolutely
                   positioned REPLACED element, width:auto resolves to the
                   element's INTRINSIC width, not to the space between left and
                   right -- which made the overlay 1239 px wide inside a 390 px
-                  phone and pushed two faces out of reach. It rendered without
+                  phone and pushed the overlay out of alignment. It rendered without
                   an error; only a tap test found it. */}
                 {importedVideo ? (
                   <video
@@ -6491,35 +4912,20 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                   the browser was already showing.
 
                   Same fit as the picture, and the canvas bitmap is sized from
-                  the same source, so the two share an aspect ratio -- that is
-                  what keeps the boxes registered with the faces. */}
+                  the                   same source, so the boxes stay registered with the picture. */}
                 {/* Also on this device's own camera, where the boxes come from
                   the server (/detect_ws) and are only drawn, never tapped. */}
-                {((detectionLocation === "browser" && detectsHere) ||
-                  capturesOwnCamera ||
-                  importedVideo ||
-                  localCameraPreview ||
-                  textOn) && (
+                {(observing || textOn) && canDetect && (
                   <canvas
                     ref={overlayRef}
-                    // Clickable ONLY when faces are being detected here. Hands
-                    // and objects keep the pointer-events: none the CSS gives
-                    // it, so nothing about those two changes.
+                    // The overlay is clickable only for text-box reading.
                     className={
                       `camera-overlay-canvas absolute inset-0 block h-full w-full ${fitClass} ` +
-                      (((faceMode && detectsHere) || textOn) && !importedVideo
+                      (textOn && !importedVideo
                         ? "pointer-events-auto cursor-pointer touch-manipulation"
                         : "pointer-events-none")
                     }
-                    onPointerDown={
-                      importedVideo
-                        ? undefined
-                        : textOn
-                          ? handleTextTap
-                          : detectsHere
-                            ? handleOverlayPointerDown
-                            : undefined
-                    }
+                    onPointerDown={textOn && !importedVideo ? handleTextTap : undefined}
                   />
                 )}
               </>
@@ -6589,7 +4995,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
               - `fixed`, sitting one gap ABOVE the bar. The offset is
                 --app-shell-footer-height, which Mantine keeps up to date
                 through the breakpoint (164 px on a phone, 124 from `sm`, 52
-                with no face panel), so this follows a bar that changes height
+                with no side panels), so this follows a bar that changes height
                 instead of guessing at one number.
               - z-index 101. The bar is 100 and the two panels are 101; at
                 z-[1] this was painted UNDER the bar, present in the DOM and
@@ -6674,7 +5080,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
               onOpen={openSaved}
               onDelete={deleteSaved}
               onClear={clearSaved}
-              colourOf={savedColour}
               // Above "Smetti di condividere" while it is shown: at the same
               // height the strip covered it on a phone.
               raised={sharing && capturesOwnCamera}
@@ -6888,27 +5293,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
           className="left-[var(--app-shell-navbar-offset,0px)] right-[var(--app-shell-aside-offset,0px)]
                    border-t border-white/10 bg-black/55 text-white backdrop-blur-sm"
         >
-          {faceMode && detectsHere ? (
-            <FaceDetail
-              detection={selectedFace}
-              judges={faceJudges}
-              faceCount={faceCount}
-              busy={savingFace}
-              onSave={startEnrol}
-              onEdit={startEdit}
-              onDetails={() =>
-                setPinnedSnapshot(selectedFace?.identity?.person ?? null)
-              }
-              onAddView={addViewToSelected}
-              onPickPerson={() => {
-                pickImagesRef.current = null;
-                stripEntryRef.current = null;
-                setPickValue(null);
-                setPickOpen(true);
-              }}
-              addingView={addingView}
-            />
-          ) : someoneElseShares ? (
+          {someoneElseShares ? (
             <Group h="100%" px="sm" justify="center">
               <Text size="sm" c="dimmed" ta="center">
                 Stai guardando la fotocamera di un altro dispositivo.
@@ -6989,145 +5374,12 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
           >
             <AppShell.Section>
               <Text fw={600} size="sm" mb="xs">
-                {serverIsPi ? "Raspberry" : "Server"}
+                Server
               </Text>
             </AppShell.Section>
             <AppShell.Section grow component={ScrollArea} className="text-left">
               <Stack gap="md" pb="md">
-                {/* Grouped by WHERE the hardware is. "Pi Camera" and "Camera server
-              0" previously sat side by side with nothing saying that one is
-              the ribbon-cable module and the other a USB stick in the same
-              machine.
-
-              Mantine's Fieldset draws the box and the legend: the panel used to
-              be one undivided column where a heading was only slightly bolder
-              text, and which buttons belonged to which heading was a matter of
-              reading carefully. */}
-                {/* The whole group is hidden when it would hold no buttons at all:
-              no camera module AND no USB webcam found by the scan. It used to
-              render its heading unconditionally, so a Pi with nothing attached
-              showed "Videocamere del Raspberry" over an empty space. A USB
-              webcam on its own still brings the group back, so no camera that
-              exists ever becomes unreachable. */}
-                {(hasPiCamera || (usbDevices?.length ?? 0) > 0) && (
-                  /* "del Raspberry" only when it really is the Raspberry. Seen from
-             the machine running the server it is "questo PC"; seen from a
-             phone pointed at that same PC it is "del server", which is the
-             only wording true from both ends. */
-                  <Fieldset
-                    variant="filled"
-                    radius="md"
-                    p="xs"
-                    legend={
-                      serverIsPi
-                        ? "Videocamere del Raspberry"
-                        : clientIsServer
-                          ? "Videocamere di questo PC"
-                          : "Videocamere del server"
-                    }
-                  >
-                    <Stack gap="xs">
-                      {/* Hidden when no camera module is attached. libcamera also
-                  enumerates USB webcams, and picamera2 opens them with red and
-                  blue swapped, so offering this for a webcam only produces a
-                  wrong-looking picture -- those belong to the USB buttons. */}
-                      {hasPiCamera && (
-                        <Button
-                          // "filled" is what the old `.active` class marked: the
-                          // source currently selected on the server.
-                          variant={
-                            shownWebcam.source === "picamera"
-                              ? "filled"
-                              : "light"
-                          }
-                          onClick={() => pickWebcam("picamera")}
-                          disabled={switching}
-                          title="Il modulo collegato al connettore CSI con il cavo piatto"
-                        >
-                          Modulo Pi Camera
-                        </Button>
-                      )}
-                      {/* One button per webcam the scan actually found. Previously
-                  two buttons were hardcoded, so a second one was offered even
-                  with nothing plugged in -- and labelled "Webcam USB 2" from a
-                  placeholder, an index that need not exist. */}
-                      {/* Nothing until the scan has answered: `usbDevices ?? [0]`
-                  invented a "Webcam USB 0" button for a camera that need not
-                  exist. */}
-                      {(usbDevices ?? []).map((index) => (
-                        <Button
-                          key={index}
-                          variant={
-                            shownWebcam.source === "usb" &&
-                            shownWebcam.index === index
-                              ? "filled"
-                              : "light"
-                          }
-                          onClick={() => pickWebcam("usb", index)}
-                          disabled={switching}
-                          title={
-                            serverIsPi
-                              ? `Webcam USB collegata al Raspberry, /dev/video${index}`
-                              : `Webcam della macchina che esegue il server, indice ${index}. ` +
-                                "Su Windows e' anche la webcam integrata, non serve una chiavetta USB."
-                          }
-                        >
-                          {/* Off the Raspberry this is whatever camera the server
-                      machine has, integrated laptop webcam included. Calling
-                      it "USB" made it look like it needed hardware plugged in
-                      that is not there. */}
-                          {serverIsPi
-                            ? `Webcam USB ${index}`
-                            : `Webcam ${index}`}
-                        </Button>
-                      ))}
-                      {/* Nothing is shared until this is pressed, and it is how you
-                  stop: like "Condividi con gli altri" on a phone. */}
-                      <Button
-                        type="button"
-                        variant="filled"
-                        color={webcamOn && cameraShared ? "red" : "green"}
-                        onClick={toggleWebcam}
-                        disabled={switching || someoneElseShares}
-                        title={
-                          someoneElseShares
-                            ? "Un altro dispositivo sta condividendo la sua fotocamera"
-                            : webcamOn && cameraShared
-                              ? "Gli altri dispositivi non la vedranno piu'; qui resta accesa"
-                              : "Accende la webcam scelta e la mostra a tutti i dispositivi"
-                        }
-                      >
-                        {webcamOn && cameraShared
-                          ? "Smetti di condividere"
-                          : "Condividi la webcam"}
-                      </Button>
-                    </Stack>
-                  </Fieldset>
-                )}
-
-                {/* OUTSIDE the group above, deliberately. That group hides itself
-              when no camera has been found, and with the rescan inside it a
-              machine with nothing attached had no way to look for one -- which
-              is precisely when you need this button. Verified: with no camera
-              on the Pi the group is gone and this is still here.
-
-              An ACTION, not a choice, so it must not look like the source
-              buttons: filled blue against their "default". On a dark panel an
-              outlined button reads as background, which is how the first
-              attempt at making it "different" made it invisible instead.
-
-              Outside the boxes too, for the same reason: it is not part of the
-              "which camera" choice, it is how you go and look for one. */}
-                <Button
-                  type="button"
-                  variant="filled"
-                  color="blue"
-                  onClick={scanUsbDevices}
-                  loading={scanning}
-                >
-                  {scanning ? "Ricerca in corso..." : "Cerca videocamere"}
-                </Button>
-
+                {connectedDevicesFieldset}
                 {/* The weight of the picture the server's OWN camera sends. Not
               per device -- the camera encodes each frame once and every
               viewer gets that same JPEG -- and not applicable at all while a
@@ -7795,7 +6047,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                             <Text size="xs" c="dimmed">
                               Misura solo il metodo scelto e lo attiva, senza
                               rifare l'intera misurazione. Costo per fotogramma
-                              su questo Raspberry: orb ~30 ms, template ~270 ms,
+                              su questo server: orb ~30 ms, template ~270 ms,
                               proposals ~440 ms. Se il metodo non separa le foto
                               con l'oggetto da quelle senza, il server lo
                               rifiuta e lo dice.
@@ -8027,130 +6279,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                   </Fieldset>
                 )}
 
-                {/* Turns this machine into a WiFi access point, so phones can reach
-              the app with no router and no internet. It is the server's own
-              network, which is why it sits in this panel and not the other.
-              Administrators only -- the server checks that too, so hiding it
-              here is convenience, not the protection. */}
-                {account.is_admin && accessPoint && (
-                  <Fieldset variant="filled" radius="md" p="xs" legend="Rete">
-                    <Stack gap="xs">
-                      {/* A button and not a switch, on purpose. A switch moves under
-                  your finger and the question comes afterwards, which is the
-                  wrong order for something that takes wlan0 off the router:
-                  the gesture already looked done. A button does nothing except
-                  open the question -- both ways round. */}
-                      <Button
-                        variant={
-                          accessPoint.state === "on" ? "default" : "light"
-                        }
-                        disabled={!accessPoint.supported || accessPointBusy}
-                        loading={accessPointBusy}
-                        onClick={() =>
-                          accessPoint.state === "on"
-                            ? setConfirmApOff(true)
-                            : setConfirmApOn(true)
-                        }
-                        size="sm"
-                        title={
-                          accessPoint.supported
-                            ? `La rete parte da questo ${accessPoint.platform === "Windows" ? "PC" : "Raspberry"} ` +
-                              `all'indirizzo ${accessPoint.ap_address}`
-                            : accessPoint.detail
-                        }
-                      >
-                        {accessPoint.state === "on"
-                          ? "Spegni la rete WiFi"
-                          : "Crea una rete WiFi"}
-                      </Button>
-                      {/* The address, while the network is up. It used to live only in
-                  a toast that never expired, which covered the page and was
-                  gone the moment anybody dismissed it -- and this is precisely
-                  the thing you have to read off a screen and type into a
-                  phone. */}
-                      {accessPoint.state === "on" && accessPoint.ap_address && (
-                        <Stack gap={2}>
-                          <Text size="xs" c="dimmed">
-                            Collega il telefono alla rete, poi apri:
-                          </Text>
-                          <Text size="sm" fw={600} className="break-all">
-                            https://{accessPoint.ap_address}:8000
-                          </Text>
-                          {/* Rebuilt from the current status rather than reusing
-                      whatever the switch made earlier: the dialog is closed by
-                      then, and a stale one would show the previous network. */}
-                          <Button
-                            size="compact-xs"
-                            variant="light"
-                            onClick={async () =>
-                              setJoinQr(await buildJoinQr(accessPoint))
-                            }
-                          >
-                            Mostra il codice QR
-                          </Button>
-                        </Stack>
-                      )}
-                    </Stack>
-                  </Fieldset>
-                )}
-
-                {/* The GPIO buttons. They act on the machine running the server, so
-              this is where they belong. */}
-                <Fieldset
-                  variant="filled"
-                  radius="md"
-                  p="xs"
-                  legend="Azioni hardware"
-                >
-                  {/* Three equal-width buttons in a narrow panel is tighter than
-                "GPIO 17" fits on one line at the default padding -- wrapping
-                it onto two instead of clipping it, the same fix the Misura
-                table's button needed. */}
-                  <Group gap="xs" grow>
-                    <Button
-                      color="red"
-                      onClick={() => sendCommand("button1")}
-                      styles={{
-                        root: { height: "auto", padding: "6px 4px" },
-                        label: {
-                          whiteSpace: "normal",
-                          textAlign: "center",
-                          lineHeight: 1.2,
-                        },
-                      }}
-                    >
-                      GPIO 17
-                    </Button>
-                    <Button
-                      color="green"
-                      onClick={() => sendCommand("button2")}
-                      styles={{
-                        root: { height: "auto", padding: "6px 4px" },
-                        label: {
-                          whiteSpace: "normal",
-                          textAlign: "center",
-                          lineHeight: 1.2,
-                        },
-                      }}
-                    >
-                      GPIO 27
-                    </Button>
-                    <Button
-                      color="blue"
-                      onClick={() => sendCommand("button3")}
-                      styles={{
-                        root: { height: "auto", padding: "6px 4px" },
-                        label: {
-                          whiteSpace: "normal",
-                          textAlign: "center",
-                          lineHeight: 1.2,
-                        },
-                      }}
-                    >
-                      GPIO 22
-                    </Button>
-                  </Group>
-                </Fieldset>
               </Stack>
             </AppShell.Section>
           </AppShell.Navbar>
@@ -8170,9 +6298,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
             </AppShell.Section>
             <AppShell.Section grow component={ScrollArea} className="text-left">
               <Stack gap="md" pb="md">
-                {/* This device's own camera as the source -- the panel this belongs
-              under by name. See `thisDeviceFieldset` above the return. */}
-                {thisDeviceFieldset}
+                {deviceCameraFieldset}
                 {/* There is deliberately no "detect on the Raspberry" button.
               detection_config lives on the SERVER and is shared by every
               connected page, so one device choosing it made the Pi annotate
@@ -8187,32 +6313,19 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                   p="xs"
                   legend="Rilevamento"
                 >
-                  {/* Was a hand-written combo box: an <input>, an open/closed flag, a
-              filtered list, and key handling for Escape and Enter. Mantine's
-              searchable Select is the same control with none of that code.
-              All 82 entries: Volti, Mani and the 80 COCO classes. */}
                   <Select
                     className="detection-picker"
-                    label="Detect"
+                    label="Classificatore"
                     data={detectionOptions}
                     value={detectionChoice}
-                    // Mantine hands back null when a selection is cleared; there is no
-                    // "detect nothing" state here, so ignore it and keep the current.
                     onChange={(value) => value && selectDetection(value)}
                     searchable
-                    searchValue={detectionSearch}
-                    onSearchChange={setDetectionSearch}
-                    // Clicking in empties the field, so the whole list is offered and
-                    // you can type over it immediately.
-                    onFocus={() => setDetectionSearch("")}
-                    // Clicking away (or Escape) without choosing puts the current
-                    // class name back, instead of leaving the box blank or holding a
-                    // half-typed word that is not what is being detected.
-                    onDropdownClose={() =>
-                      setDetectionSearch(currentDetectionLabel)
-                    }
                     nothingFoundMessage="Nessun risultato"
-                    placeholder="cerca..."
+                    placeholder={
+                      objectList.length
+                        ? "Nessun classificatore selezionato"
+                        : "Crea un classificatore"
+                    }
                     // Locked while another device is sharing: detection_config lives on
                     // the server and is shared by every page, so a change made here
                     // would silently alter what the SHARING device detects -- and only
@@ -8225,70 +6338,13 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                           ? "I classificatori vengono rilevati sul server"
                           : undefined
                     }
-                    // The list is long (every COCO class): cap it and let it scroll,
-                    // and portal it so it is not clipped by the panel's overflow.
                     maxDropdownHeight={280}
                     comboboxProps={darkDropdown}
                   />
-                  {/* Only while hands are being detected, and not rendered at all
-              otherwise: it means nothing for faces or objects. */}
-                  {detectionChoice === HAND_OPTION && (
-                    <Select
-                      mt="sm"
-                      label="Mani da rilevare"
-                      data={[
-                        { value: "1", label: "1" },
-                        { value: "2", label: "2" },
-                      ]}
-                      value={handCount}
-                      onChange={(value) => value && changeHandCount(value)}
-                      allowDeselect={false}
-                      comboboxProps={darkDropdown}
-                    />
-                  )}
-                  {/* Hands and objects only: faces have no server-side detector, and
-              a classifier has no BROWSER detector -- the opposite gap, same
-              reason there is nothing to choose. Not rendered at all for
-              either, nor while this page shows its own camera (see
-              detectionLocation). Locked while another device shares, like
-              "Detect": the setting is the server's and shared. */}
-                  {detectionChoice !== FACE_OPTION &&
-                    !isClassifierChoice(detectionChoice) &&
-                    !capturesOwnCamera && (
-                      <Select
-                        mt="sm"
-                        label="Dove rilevare"
-                        data={[
-                          { value: "browser", label: "Questo dispositivo" },
-                          { value: "server", label: "Server" },
-                        ]}
-                        value={locationChoice}
-                        onChange={(value) => value && changeLocation(value)}
-                        allowDeselect={false}
-                        disabled={switching || someoneElseShares}
-                        comboboxProps={darkDropdown}
-                      />
-                    )}
                   {/* TEMPORARY diagnostic readout -- remove with fpsTimer. */}
                   {videoFps != null && (
                     <Text size="xs" c="dimmed" mt="sm">
                       Video ricevuto: {videoFps} fotogrammi/s
-                    </Text>
-                  )}
-                  {/* TEMPORARY diagnostic readout -- remove with recordTiming. */}
-                  {detectTiming && (
-                    <Text size="xs" c="dimmed" mt="sm">
-                      Modello {detectTiming.model ?? "–"} ms · andata e ritorno{" "}
-                      {detectTiming.roundTrip} ms · disegno {detectTiming.draw}{" "}
-                      ms · {detectTiming.perSecond} rilevamenti/s ·{" "}
-                      {detectTiming.delegate === "GPU"
-                        ? "su GPU"
-                        : detectTiming.delegate === "CPU"
-                          ? "su processore"
-                          : "motore sconosciuto"}
-                      {detectTiming.renderer
-                        ? ` (${detectTiming.renderer})`
-                        : ""}
                     </Text>
                   )}
                 </Fieldset>
@@ -8299,8 +6355,7 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
 
               Worth a sentence under it rather than a bare label: "riempi lo
               schermo" sounds like an improvement with no cost, and the cost is
-              that a face at the edge of the frame is cropped away and can no
-              longer be tapped. */}
+              that the edges of the frame are cropped away. */}
                 <Fieldset variant="filled" radius="md" p="xs" legend="Video">
                   <Stack gap="sm">
                     <Switch
@@ -8326,216 +6381,42 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
                     <Text size="sm">
                       Collegato come <strong>{account.username}</strong>
                     </Text>
-                    {/* User management left this page: it lives at /admin/, which
-                  also does roles, renames, password resets, connected devices
-                  and the face records. One place, not two that can disagree. */}
+                    {/* User management lives at /admin/. */}
                     {account.is_admin && (
                       <>
                         <Button variant="light" component="a" href="/admin/">
                           Amministrazione
                         </Button>
-                        <Button
-                          variant="light"
-                          size="sm"
-                          onClick={() => {
-                            setRekeyCurrent("");
-                            setRekeyNew("");
-                            setRekeyConfirm("");
-                            setRekeyOpen(true);
-                          }}
-                        >
-                          Cambia password cifratura
-                        </Button>
-                        {setupData && (
-                          <Text size="xs" c="dimmed" ta="center">
-                            Utenti: {setupData.users} (admin{" "}
-                            {setupData.admins}), volti salvati:{" "}
-                            {setupData.people}
-                          </Text>
-                        )}
                       </>
                     )}
                   </Stack>
                 </Fieldset>
+                <Divider />
+                <Button
+                  variant="filled"
+                  color="red"
+                  c="white"
+                  size="md"
+                  fullWidth
+                  onClick={onLoggedOut}
+                >
+                  Esci
+                </Button>
               </Stack>
-            </AppShell.Section>
-
-            {/* Out of the scrolling area and pinned to the bottom of the panel.
-            It used to be the last item in the scroll, so on a short screen you
-            had to scroll to log out, and it sat directly under
-            "Amministrazione" as a subtle red line of text -- the quietest
-            control in the panel for the one action that ends the session.
-
-            Now it is bordered, full width and alone below a divider: told
-            apart by its position and its weight, not only by its word. */}
-            <AppShell.Section>
-              <Divider mb="xs" />
-              {/* Ends this session on this device. It posts /logout, the server
-              clears the cookie, and the page goes back to the login form --
-              nothing on the Pi stops and nobody else is disconnected. */}
-              {/* Filled red with white text, not an outline: on a dark panel an
-              outlined button reads as background, which is the same mistake
-              "Cerca videocamere" was fixed for further up. */}
-              <Button
-                variant="filled"
-                color="red"
-                c="white"
-                size="md"
-                fullWidth
-                onClick={onLoggedOut}
-              >
-                Esci
-              </Button>
             </AppShell.Section>
           </AppShell.Aside>
         </MantineProvider>
       </AppShell>
 
-      {/* Opened the moment the network is actually up. The point is the QR:
-          the password is long on purpose, and reading it aloud to someone
-          holding a phone is where this always went wrong.
-
-          Deliberately NOT inside the dark panels: it is a dialog in the middle
-          of the screen, and a QR is read by a camera, so it stays black on
-          white whatever the rest of the app is doing. */}
       <Modal
-        opened={joinQr !== null}
-        onClose={() => setJoinQr(null)}
-        title="Collega un telefono a questa rete"
+        opened={infoMessage !== null}
+        onClose={() => setInfoMessage(null)}
+        title="Informazioni"
         centered
       >
-        <Stack gap="md" align="center">
-          <Text size="sm" ta="center">
-            Rete <strong>{joinQr?.ssid}</strong>
-          </Text>
-          {joinQr?.image ? (
-            <>
-              <Image
-                src={joinQr.image}
-                alt={`Codice QR per collegarsi alla rete ${joinQr?.ssid}`}
-                w={240}
-                h={240}
-                // A white frame around it, so the code keeps its quiet zone
-                // even on a dark page. A QR printed edge-to-edge on a dark
-                // background is a QR that will not scan.
-                className="rounded-md bg-white p-2"
-              />
-              <Text size="sm" c="dimmed" ta="center">
-                Inquadra il codice con la fotocamera del telefono per collegarti
-                senza digitare la password.
-              </Text>
-            </>
-          ) : (
-            <Text size="sm" c="dimmed" ta="center">
-              La password della rete non e' disponibile su questo server, quindi
-              il codice QR non puo' essere creato. Aggiorna l'assistente con{" "}
-              <strong>sudo ./deploy/install-ap.sh</strong> e riaccendi la rete.
-            </Text>
-          )}
-          <Text size="sm" ta="center">
-            Poi apri <strong>https://{joinQr?.address}:8000</strong>
-          </Text>
-          <Button fullWidth onClick={() => setJoinQr(null)}>
-            Chiudi
-          </Button>
-        </Stack>
+        <Text size="sm">{infoMessage}</Text>
       </Modal>
 
-      {/* Switching the network OFF is asymmetric with switching it on: if the
-          device you are reading this on joined through that very network, the
-          request succeeds and the answer never arrives, because the network it
-          would have come back over no longer exists. The page then sits there
-          looking broken. Hence the warning -- and only on the off direction. */}
-      {/* The direction that was never asked about, and the one that costs the
-          most: on a Raspberry with only WiFi there is a single wlan0, so
-          raising the network takes it off the router -- the server loses the
-          internet and every device reading this page through the router loses
-          the page. */}
-      <Modal
-        opened={confirmApOn}
-        onClose={() => setConfirmApOn(false)}
-        title="Creare la rete WiFi?"
-        centered
-      >
-        <Stack gap="md">
-          <Text size="sm">
-            Questo {accessPoint?.platform === "Windows" ? "PC" : "Raspberry"}{" "}
-            smette di usare il WiFi di casa e crea una rete propria
-            {accessPoint?.ssid ? (
-              <>
-                {" "}
-                (<strong>{accessPoint.ssid}</strong>)
-              </>
-            ) : null}
-            .
-          </Text>
-          <Text size="sm" c="dimmed">
-            Il server resta senza internet, e chi sta guardando questa pagina
-            attraverso il router di casa la perde: per continuare dovra'
-            collegarsi alla rete nuova
-            {accessPoint?.ap_address ? (
-              <> e aprire https://{accessPoint.ap_address}:8000</>
-            ) : null}
-            .
-          </Text>
-          <Group justify="flex-end" gap="sm">
-            <Button variant="default" onClick={() => setConfirmApOn(false)}>
-              Annulla
-            </Button>
-            <Button
-              loading={accessPointBusy}
-              onClick={() => {
-                setConfirmApOn(false);
-                applyAccessPoint(true);
-              }}
-            >
-              Crea la rete
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
-
-      <Modal
-        opened={confirmApOff}
-        onClose={() => setConfirmApOff(false)}
-        title="Spegnere la rete WiFi?"
-        centered
-      >
-        <Stack gap="md">
-          <Text size="sm">
-            I dispositivi collegati a{" "}
-            <strong>{accessPoint?.ssid ?? "CameraPi"}</strong> perderanno subito
-            la connessione.
-          </Text>
-          <Text size="sm" c="dimmed">
-            Se stai leggendo questa pagina proprio attraverso quella rete,
-            perderai il collegamento anche tu: per riaccenderla dovrai tornare
-            sul Raspberry o sul PC che esegue il server.
-          </Text>
-          <Group justify="flex-end" gap="sm">
-            <Button variant="default" onClick={() => setConfirmApOff(false)}>
-              Annulla
-            </Button>
-            <Button
-              color="red"
-              loading={accessPointBusy}
-              onClick={() => {
-                setConfirmApOff(false);
-                applyAccessPoint(false);
-              }}
-            >
-              Spegni la rete
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
-
-      {/* Reaching a record by name instead of by face. The list is searchable
-          because eighty COCO classes already proved that a long list you have
-          to scroll is a list you cannot use. */}
-      {/* Naming a classifier. Asked BEFORE any photograph is taken, because a
-          pile of pictures whose subject you have to remember is the thing this
-          exists to stop. */}
       <Modal
         opened={newObjectOpen}
         onClose={() => setNewObjectOpen(false)}
@@ -8795,106 +6676,6 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
         </Stack>
       </Modal>
 
-      <Modal
-        opened={pickOpen}
-        onClose={() => setPickOpen(false)}
-        title="Aggiungi questa inquadratura a…"
-        // Near the top rather than centred, where the phone's keyboard covered
-        // it -- but under the toasts (they start 56 px down, see main.jsx, and
-        // a three-line one ends at about 170 px), which covered its title.
-        yOffset={180}
-        // Mantine caps a dialog at the screen height minus TWICE its offset.
-        // With the phone's keyboard up that left ~120 px: the field scrolled
-        // out of sight and its list closed as it opened. It may use all the
-        // height below it instead.
-        classNames={{ content: "!max-h-[calc(100dvh-190px)]" }}
-      >
-        <Stack gap="md">
-          <Text size="sm" c="dimmed">
-            L'inquadratura attuale viene aggiunta alla persona scelta, così la
-            prossima volta verrà riconosciuta anche da questa angolazione.
-          </Text>
-          <Select
-            data={people.map((person) => ({
-              value: person.id,
-              label:
-                `${person.name} ${person.surname}`.trim() +
-                ` — ${person.samples} inquadrature`,
-            }))}
-            value={pickValue}
-            onChange={setPickValue}
-            searchable
-            nothingFoundMessage="Nessuna persona salvata"
-            placeholder="Scegli una persona"
-            maxDropdownHeight={280}
-            withinPortal
-            // Not focused on opening: that raised the phone's keyboard at once,
-            // which pushed the dialog around. It opens when the field is tapped.
-          />
-          <Group justify="flex-end">
-            <Button variant="default" onClick={() => setPickOpen(false)}>
-              Annulla
-            </Button>
-            <Button
-              disabled={!pickValue}
-              loading={addingView}
-              onClick={async () => {
-                setPickOpen(false);
-                // From the strip: its picture; from the live video: null, and
-                // the face selected there is used as before.
-                const images = pickImagesRef.current;
-                const entry = images ? stripEntryRef.current : null;
-                pickImagesRef.current = null;
-                const updated = await addViewToSelected(
-                  pickValue,
-                  images ?? undefined,
-                  entry?.id,
-                );
-                if (updated && entry) deleteSaved(entry); // saved: it leaves the strip
-              }}
-            >
-              Aggiungi
-            </Button>
-          </Group>
-        </Stack>
-      </Modal>
-
-      <FaceEnrollModal
-        opened={enrollOpen}
-        onClose={() => setEnrollOpen(false)}
-        onSubmit={submitEnrol}
-        preview={enrollPreview}
-        judges={faceJudges}
-        defaultJudge={defaultJudge}
-        saving={savingFace}
-        person={enrollPerson}
-        onAddView={
-          stripFaceImage ? () => addStripViewTo(enrollPerson?.id) : undefined
-        }
-        onDetails={
-          stripFaceImage
-            ? () => {
-                setEnrollOpen(false);
-                setPinnedSnapshot(enrollPerson);
-              }
-            : undefined
-        }
-        onPickPerson={stripFaceImage ? pickPersonForStrip : undefined}
-        position={
-          stripFaceImage ? (stripEntryRef.current?.position ?? null) : null
-        }
-        addingView={addingView}
-      />
-
-      {/* Pinned by "Dettagli" and closed only by its own button: the caption
-          under the video follows whoever is in front of the camera, so it is
-          gone the moment you look away from the screen to talk to the person.
-          This covers the screen and does not move. */}
-      <FaceRecord
-        person={pinnedPerson}
-        judges={faceJudges}
-        onClose={() => setPinnedSnapshot(null)}
-      />
     </>
   );
 }
@@ -8904,98 +6685,8 @@ function CameraApp({ account, onLoggedOut, setupData, setRekeyOpen, setRekeyCurr
 // browser, because the session cookie is unreadable to JavaScript by design
 // (HttpOnly) and only the server can say whether it is still valid.
 function App() {
-  const [setupData, setSetupData] = useState({ users: 0, admins: 0, people: 0 });
   const [account, setAccount] = useState(null);
   const [checked, setChecked] = useState(false);
-  // First-run setup: whether the server needs a database passphrase and
-  // default accounts before anything else can happen.
-  const [setup, setSetup] = useState(null); // null = not checked yet
-  const [setupBusy, setSetupBusy] = useState(false);
-  const [setupPassphrase, setSetupPassphrase] = useState("");
-  const [setupConfirm, setSetupConfirm] = useState("");
-  // Change database passphrase (administrator only, after first run).
-  const [rekeyOpen, setRekeyOpen] = useState(false);
-  const [rekeyBusy, setRekeyBusy] = useState(false);
-  const [rekeyCurrent, setRekeyCurrent] = useState("");
-  const [rekeyNew, setRekeyNew] = useState("");
-  const [rekeyConfirm, setRekeyConfirm] = useState("");
-
-  async function loadSetupStatus() {
-    try {
-      const response = await fetch(`${API_BASE}/setup/status`, SEND_COOKIE);
-      if (response.ok) {
-        const data = await response.json();
-        setSetup(data);
-        return data;
-      }
-    } catch {
-      // Server unreachable: stays null, login will fail too and show its own
-      // "Impossibile contattare il server" error.
-    }
-    return null;
-  }
-
-  async function submitSetupPassphrase(event) {
-    event.preventDefault();
-    if (!setupPassphrase || setupPassphrase !== setupConfirm) return;
-    setSetupBusy(true);
-    try {
-      const response = await fetch(`${API_BASE}/setup/passphrase`, {
-        method: "POST",
-        headers: jsonHeaders(),
-        ...SEND_COOKIE,
-        body: JSON.stringify({ passphrase: setupPassphrase }),
-      });
-      const data = await response.json();
-      if (response.ok && data.ok) {
-        // Setup complete: reload so the server now opens the encrypted stores
-        // with the chosen passphrase and the normal login flow resumes.
-        window.location.reload();
-        return;
-      }
-      toast.error(data.detail || "Impossibile impostare la passphrase.", {
-        id: "setup",
-      });
-    } catch {
-      toast.error("Impossibile contattare il server.", { id: "setup" });
-    } finally {
-      setSetupBusy(false);
-    }
-  }
-
-  async function submitRekey(event) {
-    event.preventDefault();
-    if (!rekeyCurrent || !rekeyNew || rekeyNew !== rekeyConfirm) return;
-    if (rekeyNew.length < 8) return;
-    setRekeyBusy(true);
-    try {
-      const response = await fetch(`${API_BASE}/setup/rekey`, {
-        method: "POST",
-        headers: jsonHeaders(),
-        ...SEND_COOKIE,
-        body: JSON.stringify({
-          current_passphrase: rekeyCurrent,
-          new_passphrase: rekeyNew,
-        }),
-      });
-      const data = await response.json();
-      if (response.ok && data.ok) {
-        setRekeyOpen(false);
-        setRekeyCurrent("");
-        setRekeyNew("");
-        setRekeyConfirm("");
-        toast.success("Password di cifratura cambiata.", { id: "rekey" });
-        return;
-      }
-      toast.error(data.detail || "Impossibile cambiare la password.", {
-        id: "rekey",
-      });
-    } catch {
-      toast.error("Impossibile contattare il server.", { id: "rekey" });
-    } finally {
-      setRekeyBusy(false);
-    }
-  }
 
   async function loadAccount() {
     try {
@@ -9009,28 +6700,8 @@ function App() {
   }
 
   useEffect(() => {
-    async function init() {
-      const status = await loadSetupStatus();
-      setChecked(true);
-      if (!status?.first_run) {
-        await loadAccount();
-      }
-    }
-    init();
+    loadAccount();
   }, []);
-
-  useEffect(() => {
-    if (!account || !account.is_admin) return;
-    async function loadSetupDataInfo() {
-      try {
-        const response = await fetch(`${API_BASE}/setup/data-info`, SEND_COOKIE);
-        if (response.ok) setSetupData(await response.json());
-      } catch {
-        // Silente: il server potrebbe non rispondere.
-      }
-    }
-    loadSetupDataInfo();
-  }, [account]);
 
   async function logout() {
     try {
@@ -9045,109 +6716,6 @@ function App() {
   // first would make it flash on screen for already-logged-in users.
   if (!checked) return null;
 
-  // First run: no database and no passphrase yet. Show the setup modal
-  // instead of the login form. The modal cannot be dismissed until a
-  // passphrase is chosen and submitted.
-  if (setup?.first_run && !setup.passphrase_set) {
-    return (
-      <div className="flex items-center justify-center min-h-screen p-6 box-border">
-        <Paper
-          component="form"
-          onSubmit={submitSetupPassphrase}
-          className="flex flex-col gap-4 w-full max-w-80 p-7 border border-[#444] rounded-lg
-                     dark:bg-[var(--mantine-color-dark-5)]"
-          withBorder
-          shadow="md"
-          radius="md"
-          p="xl"
-        >
-          <Stack gap="md">
-            <Title order={1} size="h2" ta="center">
-              Prima configurazione
-            </Title>
-            <Text size="sm" ta="center">
-              Non esiste ancora un database cifrato. Scegli la password con cui
-              saranno cifrati gli archivi dell'applicazione. Non c'e' recupero
-              se la dimentichi: annotala fuori da questa macchina.
-            </Text>
-            <TextInput
-              label="Password di cifratura"
-              value={setupPassphrase}
-              autoComplete="new-password"
-              onChange={(e) => setSetupPassphrase(e.currentTarget.value)}
-            />
-            <TextInput
-              label="Conferma password"
-              value={setupConfirm}
-              autoComplete="new-password"
-              onChange={(e) => setSetupConfirm(e.currentTarget.value)}
-            />
-            <Button
-              type="submit"
-              loading={setupBusy}
-              disabled={
-                !setupPassphrase ||
-                setupPassphrase !== setupConfirm ||
-                setupPassphrase.length < 8
-              }
-              fullWidth
-            >
-              {setupBusy ? "Imposta…" : "Imposta la password"}
-            </Button>
-          </Stack>
-        </Paper>
-      </div>
-    );
-  }
-
-  {/* Change database passphrase modal (administrator only). */}
-  <Modal
-    opened={rekeyOpen}
-    onClose={() => setRekeyOpen(false)}
-    title="Cambia password di cifratura"
-    centered
-  >
-    <form onSubmit={submitRekey}>
-      <Stack gap="md" p="xl">
-        <Title order={3} size="h4">
-          Cambia la password con cui sono cifrati gli archivi dell'applicazione.
-          I dati non vengono toccati: cambia solo la chiave di protezione.
-        </Title>
-        <TextInput
-          label="Password attuale"
-          value={rekeyCurrent}
-          autoComplete="current-password"
-          onChange={(e) => setRekeyCurrent(e.currentTarget.value)}
-        />
-        <TextInput
-          label="Nuova password"
-          value={rekeyNew}
-          autoComplete="new-password"
-          onChange={(e) => setRekeyNew(e.currentTarget.value)}
-        />
-        <TextInput
-          label="Conferma nuova password"
-          value={rekeyConfirm}
-          autoComplete="new-password"
-          onChange={(e) => setRekeyConfirm(e.currentTarget.value)}
-        />
-        <Button
-          type="submit"
-          loading={rekeyBusy}
-          disabled={
-            !rekeyCurrent ||
-            !rekeyNew ||
-            rekeyNew !== rekeyConfirm ||
-            rekeyNew.length < 8
-          }
-          fullWidth
-        >
-          {rekeyBusy ? "Cambia…" : "Cambia password"}
-        </Button>
-      </Stack>
-    </form>
-  </Modal>
-
   if (!account) {
     return (
       <Login
@@ -9158,7 +6726,11 @@ function App() {
     );
   }
 
-  return <CameraApp account={account} onLoggedOut={logout} setupData={setupData} setRekeyOpen={setRekeyOpen} setRekeyCurrent={setRekeyCurrent} setRekeyNew={setRekeyNew} setRekeyConfirm={setRekeyConfirm} />;
+  return (
+    <>
+      <CameraApp account={account} onLoggedOut={logout} />
+    </>
+  );
 }
 
 export default App;

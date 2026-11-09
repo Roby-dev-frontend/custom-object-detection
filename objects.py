@@ -1,9 +1,8 @@
 """Named objects and the photographs taken of them.
 
-A separate encrypted store beside faces.db, opened with the same passphrase,
-because the two hold different things: faces.db holds people, this holds
-belongings. Keeping them apart means nothing in here can disturb enrolled
-people, which is the one dataset in this project that cannot be regenerated.
+A separate SQLite store from users.db,
+It holds classifier references and their photographs, independently of
+accounts and saved detection images.
 
 WHAT IS STORED, AND WHAT DELIBERATELY IS NOT
 -------------------------------------------
@@ -19,11 +18,8 @@ candidates; the representation is added once the measurement has chosen.
 
 A VIEW AND ITS PICTURE ARE ONE THING
 ------------------------------------
-Written into the schema from the start, rather than learned twice. In faces.py
-the mark and the picture were trimmed by two independent rules, and a record
-over the cap could end up with an embedding whose photograph had been evicted
--- a mark still matching, with nothing to show for itself. Here a view IS the
-row that holds the picture, so the question cannot arise.
+Written into the schema from the start, rather than learned twice. A view IS
+the row that holds the picture, so the reference and its source cannot diverge.
 """
 
 import contextlib
@@ -51,14 +47,10 @@ CREATE TABLE IF NOT EXISTS object (
     -- a person cannot choose between. NOCASE so "Tazza" and "tazza" collide,
     -- which is what anybody would expect them to do.
     name       TEXT    NOT NULL UNIQUE COLLATE NOCASE,
-    -- What the person called it when the first photograph was saved, plus the
-    -- description and traffic-light judge they chose in the same form.
-    description TEXT   NOT NULL DEFAULT '',
-    judge       TEXT   NOT NULL DEFAULT 'verde',
-    created     INTEGER NOT NULL,
-    updated     INTEGER NOT NULL,
-    created_by  TEXT    NOT NULL DEFAULT '',
-    updated_by  TEXT    NOT NULL DEFAULT ''
+    created    INTEGER NOT NULL,
+    updated    INTEGER NOT NULL,
+    created_by TEXT    NOT NULL DEFAULT '',
+    updated_by TEXT    NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS view (
@@ -215,22 +207,16 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
 """
 
-# Reentrant for the same reason faces.py's is: a write helper may call a read
+# Reentrant because a write helper may call a read
 # helper while still holding it, so nobody sees a half-applied change.
 _lock = threading.RLock()
 
 
-def connect(path: str = OBJECTS_DB, create: bool = False,
-            passphrase: Optional[str] = None) -> sqlite3.Connection:
-    """Opens the store.
-
-    `create` is False by default: a missing file must not silently become an
-    empty store -- "no objects exist yet" would look exactly like every object
-    having been deleted.
-    """
+def connect(path: str = OBJECTS_DB, create: bool = False) -> sqlite3.Connection:
+    """Opens the object store, creating it only when explicitly requested."""
     if not create and not os.path.exists(path):
         raise FileNotFoundError(
-            f"{path} does not exist. Refusing to create an empty encrypted store: "
+            f"{path} does not exist. Refusing to create an empty object store: "
             "that would look exactly like every stored object having vanished. "
             "If this really is a first run, pass create=True."
         )
@@ -241,14 +227,6 @@ def connect(path: str = OBJECTS_DB, create: bool = False,
     conn.execute("PRAGMA busy_timeout=10000")
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
-    # Columns added after the database was first created: sqlite has no
-    # "ADD COLUMN IF NOT EXISTS", so we try and swallow the duplicate error.
-    for column in ("description TEXT NOT NULL DEFAULT ''",
-                   "judge TEXT NOT NULL DEFAULT 'verde'"):
-        try:
-            conn.execute(f"ALTER TABLE object ADD COLUMN {column}")
-        except sqlite3.OperationalError:
-            pass
     # Asserted, not hoped about: foreign_keys is off by default and per
     # connection, and forgetting it raises nothing -- deleting an object would
     # simply leave every photograph of it behind, invisibly.
@@ -297,8 +275,6 @@ def _public(row: sqlite3.Row, views: int = 0,
     return {
         "id": row["id"],
         "name": row["name"],
-        "description": row["description"],
-        "judge": row["judge"],
         "views": views,
         "created": row["created"],
         "updated": row["updated"],
@@ -606,8 +582,7 @@ def get_measurement(object_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def create_object(name: str, created_by: str = "",
-                  description: str = "", judge: str = "verde") -> Dict[str, Any]:
+def create_object(name: str, created_by: str = "") -> Dict[str, Any]:
     """Raises ValueError when the name is empty, too long, or already taken."""
     name = _clean_name(name)
     object_id = secrets.token_hex(16)
@@ -618,10 +593,9 @@ def create_object(name: str, created_by: str = "",
         ).fetchone():
             raise ValueError(f"Esiste gia' un oggetto chiamato « {name} ».")
         conn.execute(
-            "INSERT INTO object (id, name, description, judge, created, updated,"
-            " created_by, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (object_id, name, description, judge, now, now, created_by,
-             created_by),
+            "INSERT INTO object (id, name, created, updated, created_by, updated_by)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (object_id, name, now, now, created_by, created_by),
         )
     return get_object(object_id)
 

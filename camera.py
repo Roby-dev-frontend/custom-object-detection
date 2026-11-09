@@ -23,8 +23,8 @@ from detection import (
 # only caps how often it may run, which keeps its CPU use no higher than when
 # it ran inline on one frame in three.
 DETECT_EVERY = 3
-# Seconds between two raw frames offered to a frame listener when detection runs
-# in the browser (5 a second). The listener's own consumer is slower still.
+# Seconds between raw frames offered to a frame listener while detection is
+# inactive (5 a second). The listener's own consumer is slower still.
 LISTENER_EVERY = 0.2
 
 # How the camera's frames are encoded before they leave this machine, and the
@@ -480,10 +480,10 @@ class LocalCameraWorker:
         # Detection runs on a thread of its own. It used to run inline on the
         # camera thread, one frame in three, and every one of those frames held
         # the camera up for the whole detection: measured on the Windows webcam,
-        # 29.1 fps with detection off against 16.9 with YOLO (73 ms a pass) and
-        # 20.5 with hands (58 ms), with single frames taking up to 265 ms. The
+        # 29.1 fps with detection off against 16.9 with detection (73 ms a pass),
+        # with single frames taking up to 265 ms. The
         # camera thread now only leaves a copy of the newest frame here and
-        # draws whatever the detector found last.
+        # draws the latest custom-classifier result.
         self._detect_thread: Optional[threading.Thread] = None
         self._detect_lock = threading.Lock()
         self._detect_input: Optional[Frame] = None
@@ -580,7 +580,7 @@ class LocalCameraWorker:
             if frame is None or self._stop_event.is_set():
                 continue
             config = self.detection_config
-            if config.get("location") == "browser" or not config.get("active", True):
+            if not config.get("active", True):
                 continue
             try:
                 detections = detect(frame, config)
@@ -589,10 +589,9 @@ class LocalCameraWorker:
                 # would keep running with the last boxes frozen on screen.
                 print(f"[camera] detection failed on one frame: {error}")
                 continue
-            # Dropped if detection moved to the browser while this pass ran,
-            # so no stale boxes come back if it is moved to the server later.
-            if (self.detection_config.get("location") != "browser"
-                    and self.detection_config.get("active", True)):
+            # Dropped if detection was deactivated while this pass ran, so no
+            # stale boxes come back after it is turned off.
+            if self.detection_config.get("active", True):
                 self._last_detections = detections
                 # The frame is this thread's own copy and nothing else uses it
                 # after this pass, so it is handed over as it is; the detections
@@ -621,19 +620,14 @@ class LocalCameraWorker:
         quality = int(self.video_encoding.get("quality") or 95)
         if 0 < width < frame_bgr.shape[1]:
             height = round(frame_bgr.shape[0] * width / frame_bgr.shape[1])
-            # INTER_AREA is the one that does not alias when shrinking, which
-            # matters here: the page the frame is going to runs a face detector
-            # over it.
+            # INTER_AREA is the one that does not alias when shrinking.
             frame_bgr = cv2.resize(frame_bgr, (width, height),
                                    interpolation=cv2.INTER_AREA)
         return cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
 
     def _push_frame(self, frame_bgr: Frame) -> None:
-        # location == "browser": publish the frame untouched and let the page
-        # detect and draw. Skipping annotate() here is the entire point of that
-        # mode -- it is 90% of the per-frame cost on a Pi 4.
-        if (self.detection_config.get("location") == "browser"
-                or not self.detection_config.get("active", True)):
+        # With detection inactive, publish the frame untouched.
+        if not self.detection_config.get("active", True):
             self._last_detections = None  # stale the moment we stop detecting
             if self.frame_listener is not None:
                 # Before _encode: the listener gets the frame as the lens (and
@@ -666,9 +660,7 @@ class LocalCameraWorker:
         if detections:
             frame_bgr = draw_detections(frame_bgr, detections)
         # `self._last_detections` is a list of {"label", "confidence", "bbox"}
-        # dicts -- see the docstring on annotate() in detection.py for the
-        # shape and examples of using it (counting, filtering by label,
-        # driving GPIO).
+        # dicts -- see detection.py for their shape.
         ok, jpeg = self._encode(frame_bgr)
         if ok:
             self.frame_hub.update(jpeg.tobytes())

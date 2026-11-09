@@ -1,6 +1,6 @@
 """Things an administrator should know about, until one of them dismisses it.
 
-A separate encrypted store, same reasoning as detections.py and objects.py:
+A separate SQLite store, same reasoning as detections.py and objects.py:
 this is written to by ordinary, non-admin actions (creating a classifier,
 say), so it cannot share a file with anything an administrator alone should
 be able to touch.
@@ -52,13 +52,11 @@ INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
 _lock = threading.RLock()
 
 
-def connect(path: str = NOTIFICATIONS_DB, create: bool = False,
-            passphrase: Optional[str] = None) -> sqlite3.Connection:
-    """Opens the store. `create` is False by default: a missing file must not
-    silently become an empty store."""
+def connect(path: str = NOTIFICATIONS_DB, create: bool = False) -> sqlite3.Connection:
+    """Opens the notification store, creating it only when explicitly requested."""
     if not create and not os.path.exists(path):
         raise FileNotFoundError(
-            f"{path} does not exist. Refusing to create an empty encrypted store. "
+            f"{path} does not exist. Refusing to create an empty notification store. "
             "If this really is a first run, pass create=True."
         )
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=10.0)

@@ -6,7 +6,7 @@
 // shape the window is. The two almost never agree, so `object-fit` has to
 // reconcile them, and a plain `(x - rect.left) / rect.width * canvas.width`
 // then lands a consistent distance from where the finger actually was. That
-// does not read as a coordinate bug: it reads as "selecting a face is flaky".
+// does not read as a coordinate bug: it reads as inconsistent pointer mapping.
 //
 // So the object-fit transform is inverted here, once, in its own file.
 //
@@ -105,25 +105,4 @@ export function pointerToCanvasClamped(canvas, clientX, clientY, fit = "contain"
     x: Math.min(width, Math.max(0, x)),
     y: Math.min(height, Math.max(0, y)),
   };
-}
-
-/**
- * The detection whose box contains this point, or null.
- *
- * Smallest box wins when boxes overlap: a face in front of another is drawn
- * inside it, and the nearer, smaller one is what a finger on that spot means.
- */
-export function detectionAt(detections, x, y) {
-  let best = null;
-  let bestArea = Infinity;
-  for (const detection of detections ?? []) {
-    const [x1, y1, x2, y2] = detection.bbox;
-    if (x < x1 || x > x2 || y < y1 || y > y2) continue;
-    const area = (x2 - x1) * (y2 - y1);
-    if (area < bestArea) {
-      bestArea = area;
-      best = detection;
-    }
-  }
-  return best;
 }

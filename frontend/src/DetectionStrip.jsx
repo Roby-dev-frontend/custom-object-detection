@@ -2,8 +2,8 @@
 // something -- see /detect_ws in server_fastapi.py.
 //
 // A strip across the bottom of the video, newest first, on every device. Each
-// thumbnail opens (a face: the save/edit form; a hand or an object: the
-// picture, bigger) and has its own round ✕ on its top-right corner, which
+// thumbnail opens the picture, bigger, and has its own round ✕ on its
+// top-right corner, which
 // deletes the entry on the server for everybody. Inside the bigger picture the
 // delete is a red "Elimina" button instead: that dialog already has a ✕, which
 // closes it. "Nascondi" / "Mostra" folds the strip away, remembered on this
@@ -43,9 +43,6 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 // simply shown.
 const HIDDEN_KEY = "detectionStripHidden";
 
-// "Sconosciuto": grey, so the people who are known stand out.
-const UNKNOWN_COLOUR = "gray.5";
-
 export function savedImageUrl(entry) {
   return `${API_BASE}/detections_saved/${entry.id}.jpg`;
 }
@@ -68,8 +65,7 @@ function readHidden() {
   }
 }
 
-/** One of the two arrows. No icon library is installed, so the glyph is a
- * chevron character inside Mantine's ActionIcon, as FaceRecord's used to be. */
+/** One of the two arrows, rendered with Mantine's ActionIcon. */
 function ScrollArrow({ left, disabled, onClick }) {
   return (
     <ActionIcon
@@ -80,40 +76,32 @@ function ScrollArrow({ left, disabled, onClick }) {
       disabled={disabled}
       onClick={onClick}
       aria-label={left ? "Immagini precedenti" : "Immagini successive"}
-      className="shrink-0"
+      className={`!flex shrink-0 items-center justify-center ${disabled ? "opacity-40" : ""}`}
     >
-      <span
-        aria-hidden
-        className={`block text-lg leading-none ${left ? "rotate-180" : ""}`}
+      <svg
+        aria-hidden="true"
+        viewBox="0 0 24 24"
+        className={`h-4 w-4 ${left ? "rotate-180" : ""}`}
+        fill="none"
+        stroke="black"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2.5"
       >
-        ›
-      </span>
+        <path d="m9 5 7 7-7 7" />
+      </svg>
     </ActionIcon>
   );
 }
 
-function Caption({ entry, colourOf }) {
-  if (entry.kind !== "face") {
-    return (
-      <Text size="xs" truncate="end" ta="center" mt={2}>
-        {entry.label}
-      </Text>
-    );
-  }
-  // A face: the name in the person's semaphore colour, on a dark background
-  // so every colour reads against any picture.
-  const colour = entry.person_id
-    ? (colourOf(entry) ?? "white")
-    : UNKNOWN_COLOUR;
+function Caption({ entry }) {
   return (
     <Text
       size="xs"
-      fw={600}
+      c="#f4f6f8"
       truncate="end"
       ta="center"
       mt={2}
-      c={colour}
-      className="rounded bg-black/75 px-1"
     >
       {entry.label}
     </Text>
@@ -125,7 +113,6 @@ export default function DetectionStrip({
   onOpen,
   onDelete,
   onClear,
-  colourOf,
   raised = false,
   // A row the page puts ABOVE the strip's own buttons, in the same fixed column
   // so it always sits just over whatever the strip is showing -- over the
@@ -140,7 +127,7 @@ export default function DetectionStrip({
   const viewportRef = useRef(null);
   // Where the row is, for greying out the arrow at each end.
   const [atStart, setAtStart] = useState(true);
-  const [atEnd, setAtEnd] = useState(false);
+  const [atEnd, setAtEnd] = useState(true);
   const shown = entries;
   // New pictures make the row longer: the right arrow comes back to life.
   useEffect(() => {
@@ -203,7 +190,7 @@ export default function DetectionStrip({
       // where an open panel covers the whole screen anyway.
       className={
         "fixed left-[var(--app-shell-navbar-offset,0px)] right-[var(--app-shell-aside-offset,0px)] " +
-        "z-[101] flex flex-col items-end gap-1 px-2 " +
+        "z-[101] flex flex-col items-end gap-1 min-[62em]:gap-3 px-2 " +
         (raised
           ? "bottom-[calc(var(--app-shell-footer-height,52px)+4rem)]"
           : "bottom-[calc(var(--app-shell-footer-height,52px)+1rem)]")
@@ -237,6 +224,8 @@ export default function DetectionStrip({
           shadow="md"
           radius="md"
           p={6}
+          bg="#242424"
+          c="#f4f6f8"
           className="flex w-full items-center gap-1"
         >
           <ScrollArrow left disabled={atStart} onClick={() => scrollBy(-1)} />
@@ -257,7 +246,10 @@ export default function DetectionStrip({
               {shown.map((entry) => (
                 // Room above and to the right for the half of the round ✕
                 // that sits outside the picture; the ScrollArea would clip it.
-                <div key={entry.id} className="w-[76px] shrink-0 pr-3 pt-3">
+                <div
+                  key={entry.id}
+                  className="w-[76px] shrink-0 pl-[calc(var(--spacing))] pr-3 pt-3"
+                >
                   <div className="relative">
                     <UnstyledButton
                       onClick={() => onOpen(entry)}
@@ -290,7 +282,7 @@ export default function DetectionStrip({
                     onClick={() => onOpen(entry)}
                     className="block w-16"
                   >
-                    <Caption entry={entry} colourOf={colourOf} />
+                    <Caption entry={entry} />
                   </UnstyledButton>
                 </div>
               ))}
@@ -322,35 +314,15 @@ export default function DetectionStrip({
   );
 }
 
-/** A hand or object picture, bigger, with a button to delete it.
- *
- * A classifier match -- its first box carries an object_id, see _save() in
- * server_fastapi.py -- also gets "Aggiungi al classificatore": one more
- * training view of the object that was just found, the object equivalent of
- * "Aggiungi a questa persona" for a recognised face. A plain YOLO class has
- * no object_id and does not get the button, since there is no classifier to
- * add it to. */
-/** One saved picture, with everything that can be done with it.
- *
- *  The object twin of FaceEnrollModal: a recognised face offers "add this
- *  picture to the person", "put it under somebody else", "open the record" and
- *  "save a new person from it", and an object hit now offers the same four
- *  against classifiers. It deliberately does not care whether the hit came
- *  from a classifier of yours or from a built-in class -- "chair" has no
- *  classifier to reinforce, but the picture of that chair is just as good a
- *  photograph to file under one.
- *
- *  What it cannot offer is the judgement and the biometric sample: those exist
- *  per person and have no object equivalent. */
+/** One saved detection picture, with classifier-training and delete actions. */
 export function SavedPictureModal({
   entry,
   onClose,
   onDelete,
   onAddToClassifier,
   addingToClassifier,
-  // All of this device's classifiers as Select options, unmeasured ones
-  // included: adding a photograph to one is how it gets measurable in the
-  // first place, so hiding those would hide exactly the ones that need it.
+  // All classifiers, including unmeasured ones, can accept another training
+  // picture.
   classifiers = [],
   onCreateClassifier,
   creatingClassifier = false,
@@ -387,6 +359,22 @@ export function SavedPictureModal({
       title={entry ? (isText ? "Testo letto" : `Rilevato: ${entry.label}`) : ""}
       centered
       size="lg"
+      classNames={{ close: "hover:!bg-white hover:!text-black" }}
+      styles={{
+        content: {
+          backgroundColor: "#242424",
+          color: "#fff",
+          "--mantine-color-body": "#000",
+          "--mantine-color-text": "#fff",
+          "--mantine-color-dimmed": "#fff",
+          "--mantine-color-default-color": "#fff",
+          "--mantine-color-default-border": "#666",
+        },
+        header: { backgroundColor: "#242424", color: "#fff" },
+        title: { color: "#fff" },
+        close: { color: "#fff" },
+        body: { color: "#fff" },
+      }}
     >
       {entry && isText && (
         <Stack gap="sm">
@@ -407,6 +395,14 @@ export function SavedPictureModal({
           )}
           <Textarea
             label="Testo"
+            styles={{
+              input: {
+                backgroundColor: "#000",
+                color: "#fff",
+                borderColor: "#666",
+              },
+              label: { color: "#fff" },
+            }}
             value={editedText ?? entry.text ?? ""}
             onChange={(event) => setEditedText(event.currentTarget.value)}
             autosize

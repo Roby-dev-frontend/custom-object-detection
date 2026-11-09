@@ -27,7 +27,7 @@ next request carrying an older number is refused.
 The counter is global, not per user: delete "mario" and recreate "mario", and a
 version that restarted at 1 would make his week-old cookie valid again.
 
-One deliberate difference from faces.py's pattern: the store lock is NEVER held
+One deliberate difference from other stores' pattern: the store lock is NEVER held
 across scrypt. Hashing is ~100 ms and 16 MB by design, and holding a lock
 across it would serialise every other authenticated request in the process,
 including the video WebSocket handshake. So: read the row under the lock, hash
@@ -43,8 +43,6 @@ import threading
 import time
 from typing import Any, Dict, Iterator, List, Optional
 
-# Plain stdlib SQLite: no database passphrase. Whoever can reach this server
-# can read the store, so keep it on a trusted LAN.
 import sqlite3
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -58,7 +56,7 @@ _SCRYPT_R = 8
 _SCRYPT_P = 1
 _SALT_BYTES = 16
 
-MIN_PASSWORD_LENGTH = 5
+MIN_PASSWORD_LENGTH = 8
 
 # The two roles. An administrator may open /admin/ and manage accounts; an
 # operatore uses the app exactly as before. The words are Italian because they
@@ -90,9 +88,11 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
 -- A monotone counter handed out to token_version, never a per-user 1.
 INSERT OR IGNORE INTO meta (key, value) VALUES ('token_seq', '1');
+-- Prevents a later empty store from silently recreating starter credentials.
+INSERT OR IGNORE INTO meta (key, value) VALUES ('bootstrap_complete', '0');
 """
 
-# Reentrant for the same reason as faces.py: a write helper may call a read
+# Reentrant because a write helper may call a read
 # helper while still holding the lock, so that nobody sees a half-applied change.
 _lock = threading.RLock()
 
@@ -103,30 +103,36 @@ def _hash_password(password: str, salt: bytes) -> str:
     ).hex()
 
 
-def connect(path: str = USERS_DB, create: bool = False,
-            passphrase: Optional[str] = None) -> sqlite3.Connection:
-    """Opens the encrypted store.
-
-    `create` is False by default for the same reason as in faces.py: SQLCipher
-    will happily make a new empty encrypted database out of a missing file and
-    any passphrase at all, and the result -- a server reporting "no accounts
-    exist yet" -- is indistinguishable from every account having been deleted.
-    """
+def connect(path: str = USERS_DB, create: bool = False) -> sqlite3.Connection:
+    """Opens the user store, creating it only when explicitly requested."""
     if not create and not os.path.exists(path):
         raise FileNotFoundError(
-            f"{path} does not exist. Refusing to create an empty encrypted store: "
+            f"{path} does not exist. Refusing to create an empty user store: "
             "that would look exactly like every account having been deleted. "
             "If this really is a first run, pass create=True."
         )
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None, timeout=10.0)
+    had_user_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'user'"
+    ).fetchone() is not None
+    had_bootstrap_marker = False
+    if had_user_table:
+        has_meta = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+        ).fetchone() is not None
+        if has_meta:
+            had_bootstrap_marker = conn.execute(
+                "SELECT 1 FROM meta WHERE key = 'bootstrap_complete'"
+            ).fetchone() is not None
     conn.execute("PRAGMA journal_mode=WAL")
     # Credentials on a machine that can lose power. The old os.replace did not
     # fsync at all, so this is strictly more durable.
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA busy_timeout=10000")
-    # stdlib's Row.
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    if had_user_table and not had_bootstrap_marker:
+        conn.execute("UPDATE meta SET value = '1' WHERE key = 'bootstrap_complete'")
     return conn
 
 
@@ -272,19 +278,66 @@ def create_user(username: str, password: str, admin: bool = False,
     if role not in ROLES:
         raise ValueError(f"Unknown role {role!r}")
 
-    # Hashed before the transaction opens, deliberately: see the module note.
     salt = secrets.token_bytes(_SALT_BYTES)
     digest = _hash_password(password, salt)
-    now = int(time.time())
-
     with _write() as conn:
         if conn.execute("SELECT 1 FROM user WHERE username = ?", (username,)).fetchone():
             raise ValueError(f"User {username!r} already exists")
-        conn.execute(
-            "INSERT INTO user (username, role, salt, hash, token_version,"
-            " created, updated, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (username, role, salt.hex(), digest, _next_token(conn), now, now, by),
-        )
+        _insert_user(conn, username, role, salt, digest, by)
+
+
+def _insert_user(conn: sqlite3.Connection, username: str, role: str,
+                 salt: bytes, digest: str, by: str) -> None:
+    """Insert pre-hashed credentials while the caller owns the write lock."""
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO user (username, role, salt, hash, token_version,"
+        " created, updated, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (username, role, salt.hex(), digest, _next_token(conn), now, now, by),
+    )
+
+
+def bootstrap_default_users() -> bool:
+    """Seed the two local starter accounts only when the user store is empty.
+
+    This is the sole narrow exception to the normal password-length rule:
+    the requested starter passwords are shorter than MIN_PASSWORD_LENGTH.
+    """
+    with _lock:
+        conn = _db()
+        completed = conn.execute(
+            "SELECT value FROM meta WHERE key = 'bootstrap_complete'"
+        ).fetchone()[0] == "1"
+        if completed:
+            return False
+        has_users = conn.execute("SELECT 1 FROM user LIMIT 1").fetchone() is not None
+    if has_users:
+        with _write() as conn:
+            conn.execute("UPDATE meta SET value = '1' WHERE key = 'bootstrap_complete'")
+        return False
+
+    initial = []
+    for username, password, role in (
+        ("admin", "admin", ADMIN),
+        ("operator", "operator", OPERATOR),
+    ):
+        salt = secrets.token_bytes(_SALT_BYTES)
+        initial.append((username, role, salt, _hash_password(password, salt)))
+    with _write() as conn:
+        completed = conn.execute(
+            "SELECT value FROM meta WHERE key = 'bootstrap_complete'"
+        ).fetchone()[0] == "1"
+        if completed:
+            return False
+        if conn.execute("SELECT 1 FROM user LIMIT 1").fetchone():
+            conn.execute(
+                "UPDATE meta SET value = '1' WHERE key = 'bootstrap_complete'"
+            )
+            return False
+        for username, role, salt, digest in initial:
+            _insert_user(conn, username, role, salt, digest, "bootstrap")
+        conn.execute("UPDATE meta SET value = '1' WHERE key = 'bootstrap_complete'")
+    return True
 
 
 def delete_user(username: str, by: str = "") -> None:
@@ -366,8 +419,7 @@ def rename_user(username: str, new_username: str, actor: str = "") -> int:
     no longer resolves and that account's cookies die on their own. Renaming
     YOURSELF therefore needs a freshly-issued cookie in the same response.
 
-    History in faces.db is left alone on purpose: created_by / updated_by are
-    plain text recording who did something at the time, not foreign keys, and
+    Historical created_by / updated_by values are plain text, not foreign keys;
     rewriting them would falsify the record.
     """
     new_username = new_username.strip()

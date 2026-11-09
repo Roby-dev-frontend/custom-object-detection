@@ -15,7 +15,6 @@ import re
 import secrets
 import sqlite3
 import statistics
-import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,28 +25,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- The database passphrase, resolved before anything can open a store -----
-#
-# This runs at IMPORT, not in __main__, and it has to: users.count_users() near
-# the bottom of this file is also at module level, so by the time __main__ is
-# reached the store has already been opened. A prompt down there would be far
-# too late.
-#
-# No argparse. This file is launched both as `python server_fastapi.py` and as
-# `python -m uvicorn server_fastapi:app --reload`, and in the second case
-# sys.argv belongs to uvicorn -- a parser here would reject --reload and kill
-# the server. A plain membership test takes the flag and leaves the rest alone.
-import users  # noqa: E402  (needed for first-run check before the prompt)
-
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_USERS_DB_PATH = os.path.join(_HERE, "users.db")
-FIRST_RUN = not os.path.exists(_USERS_DB_PATH)
-
-
-# True on the Raspberry: Linux on an ARM CPU.
-RUNNING_ON_PI = platform.system() == "Linux" and platform.machine().startswith(
-    ("arm", "aarch64")
-)
+import users  # noqa: E402
 
 from fastapi import (
     Depends,
@@ -60,7 +38,7 @@ from fastapi import (
 )
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import MutableHeaders
 from pydantic import BaseModel, Field, field_validator
@@ -88,8 +66,6 @@ from camera import (
     picamera_available,
 )
 from detection import (
-    COCO_CLASSES,
-    COCO_CLASSES_IT,
     DETECTION_CONFIG,
     Detection,
     DetectionConfig,
@@ -112,17 +88,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("server")
 
-# Primo avvio: crea gli account di default senza chiedere nulla.
-# admin / admin per l'amministratore, operator / operator per l'operatore.
-# Si possono cambiare dopo dal pannello di amministrazione o con
-# `python manage_users.py`.
-if FIRST_RUN:
-    users.connect(users.USERS_DB, create=True)
-    users.create_user("admin", "admin", admin=True, by="setup")
-    users.create_user("operator", "operator", by="setup")
-    FIRST_RUN = False
-    logger.info("setup: default accounts created (admin/admin, operator/operator)")
-
 # --- Configuration, all read from .env in one place --------------------
 # Secret used to sign session cookies. Anyone knowing it could forge a cookie
 # for any user, so it must never leave the server. Changing it invalidates
@@ -134,6 +99,9 @@ if not SESSION_SECRET:
         "Generate one with:  python -c \"import secrets; print(secrets.token_urlsafe(32))\""
     )
 ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS")
+# Known starter credentials are for a local installation only. Set APP_ENV to
+# "production" anywhere the application is exposed beyond the local machine.
+APP_ENV = os.environ.get("APP_ENV", "local").strip().lower()
 # "none" is the idle state: no local camera is opened and nothing is streamed,
 # until somebody presses "Condividi la webcam" (or picks their own camera). It
 # used to default to "usb", so the Pi's webcam streamed to whoever opened the
@@ -503,50 +471,9 @@ async def logout(response: Response) -> Dict[str, bool]:
     return {"logged_out": True}
 
 
-# --- First-run setup -------------------------------------------------------
-#
-# On the very first start no users.db exists. The server starts without asking
-# for a passphrase; the frontend shows a modal asking the user for one, then
-# POSTs it here. Stores are plain SQLite (no database passphrase): whoever can
-# reach this server can read them, so keep the server on a trusted LAN.
-
-
-class SetupPassphraseRequest(BaseModel):
-    passphrase: str
-
-
-@app.get("/setup/status")
-async def setup_status() -> Dict[str, Any]:
-    """Whether this is the first run."""
-    return {
-        "first_run": FIRST_RUN,
-    }
-
-
-@app.post("/setup/passphrase")
-async def setup_passphrase(body: SetupPassphraseRequest) -> Dict[str, Any]:
-    """Creates the stores and the default accounts. Only valid on the first run.
-
-    The passphrase is accepted but not used: stores are plain SQLite now.
-    """
-    if not FIRST_RUN:
-        return {"ok": False, "detail": "Setup already completed."}
-
-    try:
-        users.connect(users.USERS_DB, create=True)
-        users.create_user("admin", "admin", admin=True, by="setup")
-        users.create_user("operator", "operator", by="setup")
-    except Exception as error:
-        return {"ok": False, "detail": str(error)}
-
-    logger.info("setup: databases created and default accounts created")
-    _mark_first_run_done()
-    return {"ok": True}
-
-
 @app.get("/setup/data-info")
 async def setup_data_info(admin: str = Depends(require_admin)) -> Dict[str, Any]:
-    """Quanti utenti e amministratori sono presenti nei database."""
+    """Counts users and administrators before a destructive operation."""
     return {
         "users": users.count_users(),
         "admins": users.count_admins(),
@@ -769,24 +696,21 @@ async def logout_my_other_sessions(
 # has trained for can be FOUND in a frame at all. That question is answered by
 # scripts/object_bench.py, and this is how it gets its photographs.
 #
-# require_session, NOT require_admin. The whole point is that everyone who logs
-# in can contribute views of the same object, from their own phone and their
-# own angle -- one database, many users. Enrolling a face is open to every
-# operator for the same reason; only deleting is an administrator's job.
+# require_session, NOT require_admin. Everyone who logs in can contribute
+# views of the same object, from their own phone and their own angle.
 #
 # The frames arrive already encoded from the browser, which grabs them from the
 # video it is displaying. Whoever is holding the phone is therefore capturing
 # their own camera directly, at full quality, with no round trip through the
 # server and back.
 
-# Bigger than MAX_IMAGE_B64 above, on purpose: those are face crops of at most
-# 240 px, these are whole scenes with the object somewhere in them, and the
-# background is the part that makes the measurement honest.
+# Whole scenes include the object and its background, which makes the
+# measurement honest.
 MAX_CAPTURE_B64 = 900_000
 MAX_CAPTURE_IMAGES = 10
 
-# The two folders scripts/object_bench.py reads. `bench_object/` is gitignored
-# beside bench_faces/, because these are photographs of somebody's home.
+# The folders scripts/object_bench.py reads. `bench_object/` is gitignored
+# because these are photographs of somebody's home.
 CAPTURE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench_object")
 
 # Signatures of the frames in CAPTURE_ROOT's folders, so a near-copy can be
@@ -830,10 +754,9 @@ class CaptureRequest(BaseModel):
     """Frames to keep, and which of the two sets they belong to.
 
     `into` is a Literal rather than a string: the value becomes a directory
-    name, and a caller-supplied path here would reach faces.db and .env. Two
-    words are the entire vocabulary, so pydantic refuses everything else before
-    this code ever runs -- the same reasoning as the allow-list in
-    /models/{name} and the name pattern in /faces/photo/{name}.
+    name, and a caller-supplied path could escape the capture root. Two words
+    are the entire vocabulary, so pydantic refuses everything else before this
+    code ever runs.
     """
 
     into: Literal["with", "without"]
@@ -922,8 +845,6 @@ async def capture_object_frames(
 
 class NewObjectRequest(BaseModel):
     name: str
-    description: str = ""
-    judge: str = "verde"
 
 
 class RenameObjectRequest(BaseModel):
@@ -1374,10 +1295,7 @@ async def create_object(
     request: Request, body: NewObjectRequest, user: str = Depends(require_session)
 ) -> Dict[str, Any]:
     try:
-        record = await run_in_threadpool(
-            objects.create_object, body.name, user,
-            description=body.description, judge=body.judge,
-        )
+        record = await run_in_threadpool(objects.create_object, body.name, user)
     except ValueError as error:
         raise _object_error(error)
     logger.info("object created: %s by %s", record["name"], user)
@@ -1414,7 +1332,7 @@ async def remove_object(
     if not removed:
         raise HTTPException(status_code=404, detail="Oggetto non trovato.")
     # If this classifier was the thing every device was currently detecting,
-    # there is nothing left to point at -- reset to nothing for everyone,
+    # there is nothing left to point at -- clear detection for everyone,
     # rather than leaving detection_config naming an object that no longer
     # exists. classifier_detection would already return [] for it (its own
     # objects.get_measurement() check fails closed), but the Detect picker
@@ -1422,7 +1340,7 @@ async def remove_object(
     if (camera.detection_config.get("backend") == "classifier"
             and camera.detection_config.get("object_id") == object_id):
         camera.apply_detection_config(
-            {"backend": "none", "yolo_classes": None, "object_id": None}
+            {"backend": None, "object_id": None}
         )
     classifier_detection.invalidate()
     logger.info("object deleted: %s by %s", object_id, admin)
@@ -1752,7 +1670,7 @@ async def set_object_view_box(
 MAX_MEASURE_FRAMES = 60
 
 # The contact sheets compare() draws. An allow-list rather than a pattern,
-# because the name arrives in a URL -- the same care /models/{name} takes.
+# because the name arrives in a URL.
 SHEET_NAMES = {f"sheet-{name}.png" for name in ("orb", "proposals", "template")}
 
 
@@ -2097,59 +2015,6 @@ def _write_contact_sheet(rows: List[Any], path: str, columns: int = 4) -> None:
     cv2.imwrite(path, grid)
 
 
-# --- Detections reported by the browser --------------------------------
-
-
-class ReportedDetection(BaseModel):
-    """One detection as the page found it. Same shape as detection.Detection,
-    so browser-side and server-side results are interchangeable."""
-
-    label: str
-    confidence: Optional[float] = None
-    # (x1, y1, x2, y2) in pixels of the frame the page was looking at.
-    bbox: Optional[Tuple[int, int, int, int]] = None
-
-
-class DetectionsRequest(BaseModel):
-    source: Literal["remote"]
-    detections: List[ReportedDetection]
-
-
-def handle_detections(source: str, detections: List[ReportedDetection]) -> None:
-    """Called for every batch the browser reports. Deliberately does nothing.
-
-    THIS IS THE HOOK: put whatever should happen on a detection here.
-
-    Two things to keep in mind before wiring that up:
-      - Several pages can report at once, and they will disagree. Decide
-        whether the first, the last or a consensus wins.
-      - The browser only reports when the set of labels changes, plus a slow
-        heartbeat -- so this is edge-driven, not a steady stream. Do not rely
-        on it being called at any particular rate.
-    """
-
-
-@app.post("/detections", dependencies=[Depends(require_session)])
-@limiter.limit("120/minute")
-async def report_detections(
-    request: Request, body: DetectionsRequest
-) -> Dict[str, Any]:
-    """Where the browser sends what it detected, so the server can act on it.
-
-    The page draws its own boxes; nothing here affects what it displays. This
-    exists purely so detection moving off the Pi does not also move it out of
-    reach of the hardware attached to the Pi.
-    """
-    labels = [d.label for d in body.detections]
-    logger.info(
-        "detections from %s: %s",
-        body.source,
-        ", ".join(sorted(set(labels))) if labels else "(none)",
-    )
-    handle_detections(body.source, body.detections)
-    return {"received": len(body.detections)}
-
-
 # --- Which devices are connected, and which one is sharing ------------
 
 # A device is forgotten this long after its last heartbeat. Long enough to ride
@@ -2345,7 +2210,7 @@ async def presence(
         "camera_shared": camera.shared,
         # The server machine's camera is on (shared or not): a page that opens
         # must not switch it off by turning on its own.
-        "server_camera_on": False,
+        "server_camera_on": camera.source in ("usb", "picamera"),
         "device_index": camera.device_index,
         "detection_config": camera.detection_config,
         # One setting shared by every device, so each page shows what the
@@ -2356,11 +2221,6 @@ async def presence(
         "server_camera_saving": (server_camera_detection.count() > 0
                                  or server_camera_text.saving_count() > 0),
         "client_is_server": _client_is_server(request),
-        # Lets the page label the camera buttons for the machine that is
-        # actually running the server. On a Windows PC "Videocamere del
-        # Raspberry" and "/dev/video0" are simply untrue, and the only working
-        # button looked like it needed hardware that is not plugged in.
-        "server_is_pi": RUNNING_ON_PI,
         # The server's half of the sharing measurements: the rate frames really
         # arrive at, and how old one is when it leaves here. None when nothing
         # is being shared, which is also when the page hides the box.
@@ -2645,14 +2505,6 @@ class CameraManager:
                 self._busy = False
                 self._sync_worker_locked()
 
-    def wait_for_frame(self, timeout: float) -> bool:
-        """Waits until the selected source has produced its first frame, so
-        callers can tell "switched" apart from "actually showing something"."""
-        deadline = time.monotonic() + timeout
-        while frame_hub.get_latest_jpeg() is None and time.monotonic() < deadline:
-            time.sleep(SOURCE_READY_POLL_INTERVAL)
-        return frame_hub.get_latest_jpeg() is not None
-
     def probe_devices(self, indices: range) -> List[int]:
         """Finds which camera numbers actually exist by trying to open each
         one: OpenCV offers no way to list cameras, only to open one and see
@@ -2677,42 +2529,22 @@ class CameraManager:
                 for idx in indices:
                     cap = None
                     try:
-                        # On Windows, try multiple backends to find real cameras
-                        # and avoid phantom devices. Try DSHOW first, then MSMF.
-                        backends = []
                         if platform.system() == "Windows":
-                            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+                            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
                         else:
-                            backends = [cv2.CAP_ANY]
-
-                        for backend in backends:
-                            cap = cv2.VideoCapture(idx, backend)
-                            if cap.isOpened():
-                                # Read multiple frames to verify the camera works
-                                # and skip phantom devices that return empty frames.
-                                valid_frames = 0
-                                for _ in range(3):
-                                    ok, frame = cap.read()
-                                    if ok and frame is not None and frame.size > 0:
-                                        # Check frame is not all black/empty
-                                        if frame.mean() > 1.0:
-                                            valid_frames += 1
-                                        else:
-                                            break
-                                    time.sleep(0.05)
-
-                                cap.release()
-                                cap = None
-
-                                # Require at least 2 valid frames to consider camera real
-                                if valid_frames >= 2:
-                                    found.append(idx)
-                                    break  # Found working backend, try next index
-
-                            if cap is not None:
-                                cap.release()
-
+                            cap = cv2.VideoCapture(idx)
+                        if cap.isOpened():
+                            # Opening can succeed for devices that never deliver
+                            # a picture (virtual cameras, disconnected hardware),
+                            # so require a real frame before counting it.
+                            ok, _ = cap.read()
+                            if ok:
+                                found.append(idx)
                     except cv2.error as error:
+                        # The driver can throw instead of answering ("Unknown
+                        # C++ exception from OpenCV code" on Windows). That is
+                        # this one camera not answering, not a reason to fail
+                        # the whole list with a 500: skip it.
                         logger.warning("camera %d did not answer the probe: %s", idx,
                                        str(error).strip()[:120])
                     finally:
@@ -2723,6 +2555,16 @@ class CameraManager:
                 with self._lock:
                     self._busy = False
                     self._sync_worker_locked()
+
+    def wait_for_frame(self, timeout: float) -> bool:
+        """Waits until the selected source has produced its first frame, so
+        callers can tell "switched" apart from "actually showing something"."""
+        deadline = time.monotonic() + timeout
+        while frame_hub.get_latest_jpeg() is None and time.monotonic() < deadline:
+            time.sleep(SOURCE_READY_POLL_INTERVAL)
+        return frame_hub.get_latest_jpeg() is not None
+
+    # --- internal --------------------------------------------------------
 
     def _sync_worker_locked(self) -> None:
         """Starts or stops the capture thread so it matches the current state.
@@ -2777,14 +2619,7 @@ class DetectionConfigRequest(BaseModel):
     """Mirrors detection.DETECTION_CONFIG. Every field optional so callers can
     send just the part they want to change."""
 
-    backend: Optional[Literal["mediapipe", "yolo", "face", "classifier"]] = None
-    # COCO_CLASSES keys to restrict YOLO to; None means "all 80 classes".
-    yolo_classes: Optional[List[int]] = None
-    # Where detection runs. "browser" makes the server publish raw frames; see
-    # the comment on DETECTION_CONFIG in detection.py.
-    location: Optional[Literal["browser", "server"]] = None
-    # Hands the server's hand detector follows, when detection runs there.
-    num_hands: Optional[Literal[1, 2]] = None
+    backend: Optional[Literal["classifier"]] = None
     # Which classifier (objects.py) to look for; only used when
     # backend == "classifier". Validated in set_source, not here: that needs
     # objects.db, which a pydantic validator has no clean way to reach.
@@ -2793,21 +2628,12 @@ class DetectionConfigRequest(BaseModel):
     # (Osserva and Avvia off). Only the page of that camera sends it.
     active: Optional[bool] = None
 
-    @field_validator("yolo_classes")
-    @classmethod
-    def _validate_classes(cls, value: Optional[List[int]]) -> Optional[List[int]]:
-        if value is not None:
-            unknown = [i for i in value if i not in COCO_CLASSES]
-            if unknown:
-                raise ValueError(f"Unknown COCO class indices: {unknown}")
-        return value
-
 
 class SourceRequest(BaseModel):
     source: Literal["picamera", "usb", "remote", "none"]
     # Only for the server machine's own camera: show it to the other devices
-    # (True) or not (False). Left out, it is unchanged -- except that switching
-    # TO such a camera shares it.
+    # (True) or not (False). Left out, it is unchanged; changing source does
+    # not implicitly start sharing.
     shared: Optional[bool] = None
     # The page asking; the one page that keeps seeing an unshared camera.
     client_id: Optional[str] = Field(None, max_length=64)
@@ -2824,21 +2650,6 @@ SOURCE_READY_POLL_INTERVAL = 0.05
 # How long a source switch keeps the camera running on its own, until the
 # page's video stream connects and counts as a viewer.
 SOURCE_HOLD_SECONDS = 10.0
-
-
-CAMERA_PROBE_RANGE = range(5)
-
-
-@app.get("/camera_devices", dependencies=[Depends(require_session)])
-@limiter.limit("5/minute")
-async def camera_devices(request: Request) -> Dict[str, Any]:
-    # run_in_threadpool because probing opens up to five cameras in a row,
-    # which takes seconds of hardware work.
-    devices = await run_in_threadpool(camera.probe_devices, CAMERA_PROBE_RANGE)
-    # Reported so the interface can hide the Pi Camera button when no camera
-    # module is attached, rather than offering a source that cannot work.
-    picamera = await run_in_threadpool(picamera_available)
-    return {"devices": devices, "picamera": picamera}
 
 
 # Loopback, under any of the spellings a request can arrive with.
@@ -2879,12 +2690,12 @@ def _client_is_server(request: Request) -> bool:
 
 def _withheld_from(client_id: Optional[str]) -> bool:
     """True when the server machine's own camera is on but not shared, and the
-    page asking is not the one that switched it on.
-
-    There is no server camera anymore: the server only ever relays frames a
-    client chose to share, so this is always False.
-    """
-    return False
+    page asking is not the one that switched it on."""
+    return (
+        camera.source in ("usb", "picamera")
+        and not camera.shared
+        and client_id != camera.shared_owner
+    )
 
 
 @app.post("/source", dependencies=[Depends(require_session)])
@@ -2913,25 +2724,41 @@ async def set_source(request: Request, body: SourceRequest) -> Dict[str, Any]:
     # thread to finish. Calling it directly would hold up every other request.
     previous_source = camera.source
     await run_in_threadpool(camera.set_source, body.source, body.device_index)
+    source_changed = camera.source != previous_source
     if body.shared is not None:
         camera.shared = body.shared
-    elif camera.source != previous_source:
-        camera.shared = True
+    elif source_changed:
+        camera.shared = False
     if camera.shared:
         camera.shared_owner = None
-    elif body.shared is False or camera.shared_owner is None:
+    elif body.shared is False or source_changed or camera.shared_owner is None:
         camera.shared_owner = body.client_id
     # "remote" frames come from the browser over /camera_feed, which it only
-    # opens AFTER this call returns. The server has no local camera of its own
-    # to wait for, so readiness is always False here: a page selecting "remote"
-    # sees its own picture only once another client starts sharing.
-    ready = False
+    # opens AFTER this call returns -- so waiting here would always burn the
+    # full timeout for nothing.
+    if body.source in ("remote", "none"):
+        ready = False
+    else:
+        # The capture thread only runs while somebody is watching, and a page
+        # that was showing its own camera opens its video stream only AFTER
+        # this call returns -- so without a viewer of our own the camera would
+        # never start inside the wait below, and a perfectly good camera was
+        # reported as "no images". This request counts as a viewer until the
+        # page's own stream has had time to connect and take over.
+        camera.viewer_connected()
+        asyncio.get_running_loop().call_later(
+            SOURCE_HOLD_SECONDS, camera.viewer_disconnected)
+        ready = await run_in_threadpool(camera.wait_for_frame, SOURCE_READY_TIMEOUT)
     return {
         "source": camera.source,
         "shared": camera.shared,
         "device_index": camera.device_index,
         "detection_config": camera.detection_config,
         "ready": ready,
+        # Whether ANY device is currently sharing its camera. Sharing is
+        # opt-in, so a page selecting "remote" needs to be told that the
+        # picture is missing because nobody is publishing, not because
+        # something broke.
         "publishing": devices.publisher is not None,
         "client_is_server": _client_is_server(request),
     }
@@ -2941,10 +2768,8 @@ class VideoEncodingRequest(BaseModel):
     """How the local camera's frames should be encoded from now on.
 
     Four rungs are offered in the page; anything in range is accepted here.
-    The floor is not arbitrary: a watching page runs face detection at 640 px
-    and hand detection at 480 px and never scales a picture UP, so sending less
-    than 320 px would start starving the detector rather than merely softening
-    the picture.
+    The floor is not arbitrary: the custom classifier needs enough image detail,
+    and the encoder never scales a picture up.
     """
     width: int = Field(0, ge=0, le=1920)
     quality: int = Field(95, ge=30, le=100)
@@ -2957,46 +2782,19 @@ async def set_video_encoding(request: Request, body: VideoEncodingRequest) -> Di
     return {"video_encoding": camera.video_encoding}
 
 
-@app.get("/detection_classes", dependencies=[Depends(require_session)])
-@limiter.limit("30/minute")
-async def detection_classes(request: Request) -> Dict[str, Any]:
-    """The COCO classes yolov8n can detect, so the frontend's picker stays in
-    sync with COCO_CLASSES instead of hardcoding a copy that could drift out
-    of step with the indices the backend actually filters on."""
-    return {
-        "classes": COCO_CLASSES,
-        "classes_it": COCO_CLASSES_IT,
-        "detection_config": camera.detection_config,
-    }
+CAMERA_PROBE_RANGE = range(5)
 
 
-# The model files the browser needs in order to detect for itself. Served from
-# the project root rather than copied into frontend/dist, because together they
-# are ~20 MB and the build output is rebuilt (and gitignored) constantly.
-# Explicit allow-list, not a directory mount: the name arrives in the URL, and
-# anything else there would let a caller walk the filesystem.
-BROWSER_MODELS = {
-    "efficientdet_lite0.tflite": "application/octet-stream",
-}
-
-
-@app.get("/models/{name}", dependencies=[Depends(require_session)])
-async def browser_model(name: str) -> FileResponse:
-    if name not in BROWSER_MODELS:
-        raise HTTPException(status_code=404, detail="Unknown model")
-    path = os.path.join(os.path.dirname(__file__), name)
-    if not os.path.exists(path):
-        # Downloaded rather than shipped in the repo, from Google's
-        # mediapipe-models bucket -- see detector.js:
-        #   efficientdet_lite0.tflite
-        raise HTTPException(status_code=404, detail=f"{name} is not on the server")
-    # Long max-age: these files only change when the model itself is replaced,
-    # and re-downloading 20 MB on every page load over WiFi is painful.
-    return FileResponse(
-        path,
-        media_type=BROWSER_MODELS[name],
-        headers={"Cache-Control": "public, max-age=604800"},
-    )
+@app.get("/camera_devices", dependencies=[Depends(require_session)])
+@limiter.limit("5/minute")
+async def camera_devices(request: Request) -> Dict[str, Any]:
+    # run_in_threadpool because probing opens up to five cameras in a row,
+    # which takes seconds of hardware work.
+    devices = await run_in_threadpool(camera.probe_devices, CAMERA_PROBE_RANGE)
+    # Reported so the interface can hide the Pi Camera button when no camera
+    # module is attached, rather than offering a source that cannot work.
+    picamera = await run_in_threadpool(picamera_available)
+    return {"devices": devices, "picamera": picamera}
 
 
 # How often the stream checks for a new frame to send. It also sets the
@@ -3178,8 +2976,8 @@ async def video_ws(websocket: WebSocket) -> None:
     subscription = None
     try:
         await websocket.accept()
-        # Same accounting as /video_feed: viewer counting is what starts the
-        # capture and stops it when the last viewer leaves.
+        # Same accounting as /video_feed: this is what starts the Pi's capture
+        # thread and stops it when the last viewer leaves (_sync_worker_locked).
         camera.viewer_connected()
         counted = True
 
@@ -3438,7 +3236,7 @@ def _annotate_to_jpeg(
     decodable image, or when re-encoding fails.
 
     `detect` false redraws `cached` instead of detecting again -- the same
-    trade detection threading makes, for the same reason: detection costs
+    trade LocalCameraWorker makes, for the same reason: detection costs
     hundreds of milliseconds while drawing costs microseconds."""
     frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
@@ -3455,6 +3253,9 @@ def _annotate_to_jpeg(
 # whether it has been asked to stop. Only reached when the publisher has gone
 # quiet; a live stream wakes the loop ~10 times a second anyway.
 STOP_CHECK_INTERVAL = 0.5
+# Keep a GPS fix for up to one minute: the browser's watchPosition can wait
+# 30 seconds for a fresh fix, and may initially return one cached for 10 seconds.
+POSITION_MAX_AGE = 60.0
 
 
 @app.websocket("/camera_feed")
@@ -3471,6 +3272,9 @@ async def camera_feed(websocket: WebSocket) -> None:
         return
     watch = SessionWatch(websocket.cookies)
     if camera.source != "remote":
+        # Accept first so the browser receives the actionable close code rather
+        # than reporting a failed handshake as the generic 1006.
+        await websocket.accept()
         await websocket.close(code=4409)  # source not set to "remote"
         return
 
@@ -3506,6 +3310,7 @@ async def camera_feed(websocket: WebSocket) -> None:
     newest: Optional[bytes] = None
     frame_index = 0
     cached_detections: Optional[List[Detection]] = None
+    annotation_failed = False
     arrived = asyncio.Event()
     closed = asyncio.Event()
 
@@ -3585,29 +3390,41 @@ async def camera_feed(websocket: WebSocket) -> None:
             share_meter.frame_received()
             if camera.source != "remote":
                 break
-            if (
-                camera.viewer_count == 0
-                or camera.detection_config.get("location") == "browser"
-            ):
-                # Two reasons to store the client's JPEG untouched:
-                #   - nobody is watching, so decode + detection + re-encode
-                #     would burn ~40% CPU on output no one sees;
-                #   - detection runs in the browser, so the server has no
-                #     drawing left to do at all.
-                # Either way a viewer sees an image immediately, because what
-                # the client sent is already a JPEG.
+            if camera.viewer_count == 0:
+                # With no viewers, decoding and annotating only burns CPU.
+                frame_hub.update(data)
+                continue
+            if annotation_failed:
                 frame_hub.update(data)
                 continue
             # run_in_threadpool because annotate() is ~130-230 ms of CPU work on
             # a Pi 4. Run inline it would block the event loop for that long,
             # stalling the receive task above -- which would rebuild the very
             # backlog this function exists to avoid.
-            jpeg, cached_detections = await run_in_threadpool(
-                _annotate_to_jpeg,
-                data,
-                frame_index % DETECT_EVERY == 0,
-                cached_detections,
-            )
+            try:
+                jpeg, cached_detections = await run_in_threadpool(
+                    _annotate_to_jpeg,
+                    data,
+                    frame_index % DETECT_EVERY == 0,
+                    cached_detections,
+                )
+            except Exception:
+                annotation_failed = True
+                cached_detections = None
+                logger.exception(
+                    "shared video annotation failed; continuing with raw frames"
+                )
+                jpeg = data
+                try:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "detail": (
+                            "Rilevamento non disponibile sul flusso condiviso; "
+                            "il video continua senza riquadri."
+                        ),
+                    }))
+                except (WebSocketDisconnect, RuntimeError):
+                    break
             frame_index += 1
             if jpeg is not None:
                 frame_hub.update(jpeg)
@@ -3629,12 +3446,9 @@ async def camera_feed(websocket: WebSocket) -> None:
 
 # --- Detection for own-camera devices ---------------------------------------
 #
-# A device showing its OWN camera -- a phone, or a PC on its own webcam -- runs
-# no detection library: measured on a phone, in-browser hand detection took
-# ~120 ms a pass and the live view lagged behind it. It sends frames here
-# instead, over /detect_ws, and shows its camera untouched. When the server
-# finds something it keeps a few pictures of it (detections.py), and every
-# page shows them in the strip in the corner of the video.
+# A device showing its OWN camera -- a phone, or a PC on its own webcam -- sends
+# frames here over /detect_ws. The server runs the selected custom classifier
+# or reads text, and every page shows saved results in the detection strip.
 
 # One batch: up to this many pictures, at least SAVED_MIN_GAP seconds apart,
 # closed after SAVED_BATCH_MAX seconds even if it is short of pictures. Nothing
@@ -3643,39 +3457,14 @@ SAVED_PER_BATCH = 3
 SAVED_MIN_GAP = 0.5
 SAVED_BATCH_MAX = 3.0
 SAVED_PAUSE = 5.0
-SAVED_JPEG_QUALITY = 85
-# Hands and objects: a frame is not kept when its sharpness inside the detected
-# boxes is below this fraction of the median of the device's recent frames --
-# relative, because a fixed number does not carry from one camera or scene to
-# another. Nothing is dropped until SHARPNESS_MIN_HISTORY frames have been seen.
-SHARPNESS_KEEP_FRACTION = 0.5
-SHARPNESS_HISTORY = 20
+SAVED_JPEG_QUALITY = 90
+# Normalize crops before scoring; these conservative limits reject only very
+# low-detail frames and sharpness outliers.
+SHARPNESS_SIZE = 64
+SHARPNESS_HISTORY = 15
 SHARPNESS_MIN_HISTORY = 5
-# And a floor under both, whatever the recent frames were like: a camera that
-# is blurred all the time used to pass the relative rule above. Measured with
-# face_embedding.sharpness() on the detected box scaled so its longer side is
-# SHARPNESS_SIZE px, faces and hands and objects alike, so one number means the
-# same for all of them. Not on the face's 112 px aligned crop: when the face
-# is near the edge of the crop, alignment fills the rest with black, and that
-# border read a face blurred to 34 as 202. On a test portrait blurred step by
-# step, 100 keeps the slightly soft pictures (115 and up) and drops the
-# clearly blurred ones (78, 41).
-SAVE_MIN_SHARPNESS = 100.0
-SHARPNESS_SIZE = 112
-# The boxes sent back for the device's own video: a face keeps the name it was
-# given for this long, then is recognised again. A face is followed from one
-# frame to the next by how much its box overlaps its box in the frame before.
-BOX_RECOGNISE_EVERY = 1.0
-BOX_TRACK_MIN_IOU = 0.3
-# The device's position is attached to a picture only if it is at most this
-# old: a phone that lost its signal minutes ago is no longer where it said.
-POSITION_MAX_AGE = 60.0
-# At most one "face not saved" line per device this often, in the terminal.
-SKIP_LOG_EVERY = 1.0
-
-_COCO_IT_BY_NAME = {
-    name: COCO_CLASSES_IT.get(index, name) for index, name in COCO_CLASSES.items()
-}
+SAVE_MIN_SHARPNESS = 1.0
+SHARPNESS_KEEP_FRACTION = 0.25
 
 
 def _jpeg(frame: Any) -> Optional[bytes]:
@@ -3683,7 +3472,31 @@ def _jpeg(frame: Any) -> Optional[bytes]:
     return encoded.tobytes() if ok else None
 
 
+def _iou(a: Any, b: Any) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    h = max(0.0, min(ay2, by2) - max(ay1, by1))
+    inter = w * h
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
 
+
+def _scaled_sharpness(frame: Any, x1: int, y1: int, x2: int, y2: int) -> float:
+    """Variance of the Laplacian for a box scaled to SHARPNESS_SIZE."""
+    scale = SHARPNESS_SIZE / max(x2 - x1, y2 - y1)
+    scaled = cv2.resize(
+        frame[y1:y2, x1:x2],
+        (max(1, round((x2 - x1) * scale)), max(1, round((y2 - y1) * scale))),
+        interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR,
+    )
+    grey = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(grey, cv2.CV_64F).var())
+
+
+def _sharpness(frame: Any) -> float:
+    grey = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(grey, cv2.CV_64F).var())
 
 
 class DetectSession:
@@ -3697,10 +3510,8 @@ class DetectSession:
                  send_boxes: bool = True, origin: Optional[str] = None) -> None:
         self.device = device
         self.origin = origin
-        # False for the Pi's own webcam: the page already draws boxes there (it
-        # detects faces itself, or the camera worker burns them into the
-        # stream), and a second set from here would be double-drawn and a
-        # whole detection pass behind. See ServerCameraDetection.
+        # False for the Pi's own webcam: the camera worker already burns boxes
+        # into the stream. See ServerCameraDetection.
         self._send_boxes = send_boxes
         self._ready_sent = False
         # Called from this thread with one message for the device: the boxes
@@ -3714,13 +3525,10 @@ class DetectSession:
         # a bool over it made every frame that found something raise "'bool'
         # object is not callable" -- silently, see _run's handler.
         self._keep = save
-        # Faces of the last frame: {"bbox", "identity", "at"}, see _boxes.
-        self._tracks: List[Dict[str, Any]] = []
         # The device's last position ({"lat", "lon", "accuracy"}) and when it
         # arrived; see set_position.
         self._position: Optional[Dict[str, Any]] = None
         self._position_at = 0.0
-        self._skip_logged_at = 0.0
         # Whether this session has already written a full traceback; see _run.
         self._logged_fault = False
         self._lock = threading.Lock()
@@ -3759,15 +3567,6 @@ class DetectSession:
             if self._position and time.monotonic() - self._position_at <= POSITION_MAX_AGE:
                 return dict(self._position)
         return None
-
-    def _log_skipped(self, reason: str) -> None:
-        """Why a face was not put in the strip, for finding out why a group of
-        people gave no pictures. Throttled: faces are looked at every frame."""
-        now = time.monotonic()
-        if now - self._skip_logged_at < SKIP_LOG_EVERY:
-            return
-        self._skip_logged_at = now
-        logger.info("face not saved (%s): %s", self.device or "device", reason)
 
     def offer(self, data: bytes,
               frame_meta: Optional[Dict[str, Any]] = None) -> None:
@@ -3826,6 +3625,13 @@ class DetectSession:
                         "session's are logged as one-line warnings",
                         type(error).__name__,
                     )
+                    self._send({
+                        "type": "error",
+                        "detail": (
+                            "Rilevamento non riuscito. Controlla il classificatore "
+                            "selezionato e i log del server."
+                        ),
+                    })
                 else:
                     logger.warning("detection on a sent frame failed: %s: %s",
                                    type(error).__name__, error)
@@ -3859,22 +3665,16 @@ class DetectSession:
 
         `found` is what the camera already detected on this very frame, when it
         did (server-side detection on the Pi's webcam): reused, so a classifier
-        or YOLO pass is not paid for twice. It is only trusted while the config
-        still says detection runs on the server -- if it was moved to the
-        browser while the frame waited, or the backend is faces (the camera has
-        no face detector), this detects for itself as it always did."""
+        pass is not paid for twice."""
         now = time.monotonic()
         self._close_if_expired(now)
         config = dict(camera.detection_config)
         backend = config.get("backend")
-        if found is not None and config.get("location") != "server":
-            found = None
         if found is None:
             found = detect(frame, config)
-        # Sent BEFORE saving: recognising and writing the pictures of a batch
-        # took up to 2 s, and the boxes waiting behind it went stale on screen.
+        # Send boxes before saving, so a slow write cannot make them stale.
         if self._send_boxes:
-            boxes = self._boxes(frame, backend, found, now)
+            boxes = self._boxes(frame, backend, found)
             if frame_meta is not None:
                 boxes["frame_meta"] = frame_meta
             self._send(boxes)
@@ -3917,42 +3717,35 @@ class DetectSession:
             self._close(self._last_saved)
         return saved
 
-    def _boxes(self, frame: Any, backend: Optional[str], found: List[Any],
-               now: float) -> Dict[str, Any]:
+    def _boxes(self, frame: Any, backend: Optional[str],
+               found: List[Any]) -> Dict[str, Any]:
         """What the device draws over its own video, in the pixels of the frame
         it sent (w x h). An empty list clears its boxes."""
         height, width = frame.shape[:2]
         items: List[Dict[str, Any]] = []
-        self._tracks = []
         for d in found:
             item: Dict[str, Any] = {
                 "bbox": [float(v) for v in d["bbox"]],
                 "label": d.get("label"),
                 "confidence": d.get("confidence"),
             }
-            if d.get("points"):
-                item["points"] = [[float(x), float(y)] for x, y in d["points"]]
             items.append(item)
         return {"type": "boxes", "w": width, "h": height, "backend": backend, "items": items}
 
     def _save(self, frame: Any, backend: Optional[str], found: List[Any],
               object_id: Optional[str] = None) -> List[Dict[str, Any]]:
         height, width = frame.shape[:2]
-        # Hands and objects: one entry per frame, with everything drawn on it --
-        # unless the frame is blurred compared with this device's recent ones.
+        # Store the custom-classifier result unless the frame is blurred.
         x1 = max(0, min(int(d["bbox"][0]) for d in found))
         y1 = max(0, min(int(d["bbox"][1]) for d in found))
         x2 = min(width, max(int(d["bbox"][2]) for d in found))
         y2 = min(height, max(int(d["bbox"][3]) for d in found))
         if x2 - x1 < 8 or y2 - y1 < 8:
             return []
-        sharp = float(cv2.Laplacian(frame[y1:y2, x1:x2], cv2.CV_64F).var())
+        sharp = _sharpness(frame[y1:y2, x1:x2])
         history = sorted(self._sharpness)
         self._sharpness.append(sharp)
-        crop = frame[y1:y2, x1:x2]
-        scale = SHARPNESS_SIZE / max(x2 - x1, y2 - y1)
-        scaled = cv2.resize(crop, (max(1, round((x2 - x1) * scale)), max(1, round((y2 - y1) * scale))), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
-        if float(cv2.Laplacian(scaled, cv2.CV_64F).var()) < SAVE_MIN_SHARPNESS:
+        if _scaled_sharpness(frame, x1, y1, x2, y2) < SAVE_MIN_SHARPNESS:
             return []
         if len(history) >= SHARPNESS_MIN_HISTORY:
             median = history[len(history) // 2]
@@ -3963,12 +3756,8 @@ class DetectSession:
         if jpeg is None:
             return []
         kind = "object"
-        names = sorted({_COCO_IT_BY_NAME.get(d.get("label"), str(d.get("label"))) for d in found})
-        label = ", ".join(names)
-        # object_id is set only for a classifier match, not a YOLO class: it is
-        # what lets the strip offer "Aggiungi al classificatore" for one but
-        # not the other, carried through the boxes field since it is free-form
-        # JSON already (see detections.py) rather than a new DB column.
+        label = ", ".join(sorted({str(d.get("label") or "oggetto") for d in found}))
+        # The selected classifier id lets the strip offer to add this view.
         boxes = [
             {"bbox": list(d["bbox"]), "label": d.get("label"), "object_id": object_id}
             for d in found
@@ -3984,7 +3773,7 @@ class DetectSession:
 # "Leggi testo" switched on: the frames of a device are read (text_reader.
 # read_live: only confident lines), the boxes with their words go back to be
 # drawn over the video, and a view that keeps showing text is kept in the strip
-# like a detected face, with the words of the pass that found it.
+# like a detected object, with the words of the pass that found it.
 
 # A text area must be present in this many passes in a row before anything is
 # kept: one pass of a moving camera finds all sorts of things.
@@ -4099,6 +3888,14 @@ class TextSession:
                 if not self._logged_fault:
                     self._logged_fault = True
                     logger.exception("text finding failed (%s)", type(error).__name__)
+                    self._send({
+                        "type": "error",
+                        "detail": (
+                            "Lettura del testo non riuscita. Controlla i log "
+                            "del server."
+                        ),
+                    })
+                    return
                 else:
                     logger.warning("text finding failed: %s: %s", type(error).__name__, error)
 
@@ -4182,10 +3979,9 @@ class TextSession:
 
 # Who the entries saved from the Pi's own webcam are filed under: the frames are
 # the Raspberry's, not those of the page that pressed the button.
-SERVER_CAMERA_DEVICE = "Webcam del Raspberry"
+SERVER_CAMERA_DEVICE = "Webcam del server"
 # Seconds between two frames the shared session looks at: 3 a second. Saving
-# needs a few pictures a second, not thirty, and on a 4-core Pi a face pass at
-# the camera's own rate would compete with the page's detector and the video.
+# needs a few pictures a second, not thirty, which keeps its CPU use bounded.
 SERVER_SESSION_EVERY = 1 / 3
 
 
@@ -4194,7 +3990,7 @@ class ServerCameraDetection:
     pressed Avvia.
 
     A session per page would save the same moment once per page: two people
-    pressing Avvia would get two batches of three pictures of the same face.
+    pressing Avvia would get duplicate batches of the same object.
     So the first page to join creates the session and registers it with the
     camera, and the last to leave stops it and takes it down again.
     """
@@ -4336,6 +4132,18 @@ async def camera_detect_ws(websocket: WebSocket) -> None:
     sender = asyncio.create_task(send_messages())
     try:
         while True:
+            if sender.done() and not sender.cancelled():
+                try:
+                    sender.result()
+                except (WebSocketDisconnect, RuntimeError):
+                    break
+                except Exception:
+                    logger.exception("server-camera detection response channel failed")
+                    try:
+                        await websocket.close(code=1011)
+                    except (WebSocketDisconnect, RuntimeError):
+                        pass
+                    break
             try:
                 message = await asyncio.wait_for(websocket.receive(), STOP_CHECK_INTERVAL)
             except asyncio.TimeoutError:
@@ -4352,6 +4160,12 @@ async def camera_detect_ws(websocket: WebSocket) -> None:
                 break
     except (WebSocketDisconnect, RuntimeError):
         pass
+    except Exception:
+        logger.exception("server-camera detection WebSocket failed")
+        try:
+            await websocket.close(code=1011)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
     finally:
         holder.leave(sid)
         camera.viewer_disconnected()
@@ -4379,17 +4193,28 @@ async def detect_ws(websocket: WebSocket) -> None:
     save = websocket.query_params.get("save") != "0"
     loop = asyncio.get_running_loop()
     outbox: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
-    # ?mode=text: look for text in the frames instead of faces, hands, objects.
+    # ?mode=text: look for text in the frames instead of custom-classifier objects.
     send = lambda message: loop.call_soon_threadsafe(outbox.put_nowait, message)
     origin = (
         "Rilevato da un video"
         if websocket.query_params.get("origin") == "video"
         else None
     )
-    if websocket.query_params.get("mode") == "text":
-        session = TextSession(device, send, save=save, origin=origin)
-    else:
-        session = DetectSession(device, send, save=save, origin=origin)
+    try:
+        if websocket.query_params.get("mode") == "text":
+            session = TextSession(device, send, save=save, origin=origin)
+        else:
+            session = DetectSession(device, send, save=save, origin=origin)
+    except Exception:
+        logger.exception(
+            "detection session initialization failed for client %s",
+            client_id or "unknown",
+        )
+        try:
+            await websocket.close(code=1011)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        return
 
     async def send_messages() -> None:
         # Straight back to the device that sent the frames: the boxes for its
@@ -4403,6 +4228,21 @@ async def detect_ws(websocket: WebSocket) -> None:
     pending_frame_meta: Optional[Dict[str, Any]] = None
     try:
         while True:
+            if sender.done() and not sender.cancelled():
+                try:
+                    sender.result()
+                except (WebSocketDisconnect, RuntimeError):
+                    break
+                except Exception:
+                    logger.exception(
+                        "detection response channel failed for client %s",
+                        client_id or "unknown",
+                    )
+                    try:
+                        await websocket.close(code=1011)
+                    except (WebSocketDisconnect, RuntimeError):
+                        pass
+                    break
             try:
                 message = await asyncio.wait_for(websocket.receive(), STOP_CHECK_INTERVAL)
             except asyncio.TimeoutError:
@@ -4439,6 +4279,15 @@ async def detect_ws(websocket: WebSocket) -> None:
                 _take_position(session, text)
     except (WebSocketDisconnect, RuntimeError):
         pass
+    except Exception:
+        logger.exception(
+            "detection WebSocket failed for client %s",
+            client_id or "unknown",
+        )
+        try:
+            await websocket.close(code=1011)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
     finally:
         session.stop()
         sender.cancel()
@@ -4534,7 +4383,7 @@ _ocr_lock = threading.Lock()
 
 # What a read can hold, and so what a save is willing to accept back. A page of
 # dense print is about 60 lines and 3,000 characters; these leave room for
-# several, and stop a request from using the encrypted store as a file drop.
+# several, and stop a request from using the database as a file drop.
 OCR_MAX_LINES = 200
 OCR_MAX_LINE_CHARS = 1000
 OCR_MAX_TEXT_CHARS = 20_000
@@ -4715,7 +4564,7 @@ async def delete_saved_detection(entry_id: str) -> Dict[str, bool]:
 
 # --- Serve the built frontend ------------------------------------------
 # Must stay AFTER every route above: routes are matched in the order they are
-# registered, so declaring this mount earlier would let it swallow /command,
+# registered, so declaring this mount earlier would let it swallow
 # /video_feed, etc. before they are ever reached.
 #
 # Only active once `npm run build` has produced frontend/dist. When it is
@@ -4761,42 +4610,25 @@ if os.path.isdir(FRONTEND_DIST):
 else:
     logger.info("no frontend build at %s -- running API only", FRONTEND_DIST)
 
-# The stores are opened HERE, before uvicorn binds the port. `users` would be
-# opened by the count below anyway; without this probe the server would start,
-# serve the login page, and only fail later if a store is missing or unreadable.
+# The stores are opened HERE, before uvicorn binds the port, so an unreadable
+# database is reported at startup rather than on the first request.
 _STORES = (
     (users, users.USERS_DB),
+    (objects, objects.OBJECTS_DB),
     # What own-camera devices' frames were found to contain -- see /detect_ws.
     (detections, detections.DETECTIONS_DB),
+    (notifications, notifications.NOTIFICATIONS_DB),
 )
 
-# The stores that exist are opened first, to make sure they can be read.
 for _store, _path in _STORES:
-    if not os.path.exists(_path):
-        continue
-    try:
-        _store.connect(_path).close()
-    except Exception as _error:                               # noqa: BLE001
-        logger.error("Cannot open %s: %s", _path, _error)
-        raise SystemExit(78)
-
-# A store that does not exist is created empty, so the application starts on a
-# machine that holds no data yet -- a fresh checkout, or a PC used alongside the
-# Raspberry. It is not done silently: the danger faces.connect() warns about is
-# an empty store being mistaken for enrolled people having vanished, so the log
-# says plainly that this one is NEW, and where the real data would be instead.
-for _store, _path in _STORES:
-    if os.path.exists(_path):
-        continue
     try:
         _store.connect(_path, create=True).close()
     except Exception as _error:                               # noqa: BLE001
-        logger.error("Cannot create %s: %s", _path, _error)
-        raise SystemExit(78)
-    logger.warning(
-        "%s did not exist: created a NEW, EMPTY store at %s.",
-        _path, _path,
-    )
+        logger.error("cannot open SQLite store %s: %s", _path, _error)
+        raise SystemExit(1)
+
+if APP_ENV == "local" and users.bootstrap_default_users():
+    logger.warning("created local starter accounts admin/admin and operator/operator")
 
 # Nobody can log in until an account exists, and the page for creating accounts
 # itself requires being logged in as an administrator. Without this warning the
@@ -4821,21 +4653,8 @@ if __name__ == "__main__":
     # (python -m uvicorn server_fastapi:app), so the two ways never collide.
     import uvicorn
 
-    # uvicorn.run() accepts its first argument in two different shapes:
-    #
-    #   (a) app                   -> the variable created earlier in this file
-    #   (b) "server_fastapi:app"  -> a piece of text telling uvicorn: "open the
-    #                                file server_fastapi.py yourself and take
-    #                                the variable named app out of it"
-    #
-    # Shape (a) is required here. With shape (b), uvicorn executes this entire
-    # file a second time in order to reach that variable -- so line 52 runs
-    # twice, and the second run asks gpiozero for pins 17/27/22 while this
-    #
-    # What shape (a) costs: the server will NOT restart by itself when you
-    # edit the code. Restarting means running the file again, which uvicorn
-    # can only do if it was told where the file is -- that is, shape (b). So
-    # while developing, start the server the other way instead:
+    # Pass the app object to avoid importing this module a second time. For
+    # development reloads, start it by module name instead:
     #     python -m uvicorn server_fastapi:app --reload
     #
     # HOST 127.0.0.1 means only this computer can reach the server. Set

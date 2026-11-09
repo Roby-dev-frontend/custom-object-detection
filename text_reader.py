@@ -1,7 +1,7 @@
 """Reading the text in one picture.
 
-Pure vision, like object_localisers.py: JPEG bytes in, lines out, no database
-and no passphrase. Two engines, because they are good at opposite things and
+Pure vision, like object_localisers.py: JPEG bytes in, lines out, no database.
+Two engines, because they are good at opposite things and
 the first measurement of this module compared them on the wrong kind of text.
 
 THE THREE MODES
@@ -152,11 +152,9 @@ def _rapid() -> Any:
 # reading) took 0.7 to 1.3 s.
 LIVE_SIDE = 480
 # A line is shown, counted and kept only if the engine is this sure of it and it
-# holds at least this many letters or digits. Measured on three pictures where a
-# face, a mouth and a window-sill detail had been kept as "text": this engine
-# returns no line at all for them, while real lines scored 0.63 to 0.99. Edge
-# density and contrast did not separate them (0.03, 0.03 and 0.17 against 0.12
-# for real text), so they are not used.
+# holds at least this many letters or digits. Non-text regions produced no
+# reading, while real lines scored 0.63 to 0.99. Edge density and contrast did
+# not separate them, so they are not used.
 LIVE_MIN_CONFIDENCE = 0.6
 LIVE_MIN_CHARACTERS = 2
 

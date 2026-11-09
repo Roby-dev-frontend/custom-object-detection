@@ -1,0 +1,62 @@
+#!/bin/bash
+# At boot: if this machine has no working internet connection, raise the
+# access point so phones can still reach the camera app.
+#
+# Installed to /usr/local/sbin/camera-ap-autostart by deploy/install-ap.sh and
+# run once by camera-ap-autostart.service.
+#
+# The test is deliberately in two parts, because either one alone gets it
+# wrong:
+#
+#   1. Is there a real IPv4 address anywhere except loopback?
+#      No address at all means no network, full stop -- no point pinging.
+#      169.254.x.x is excluded: that is the address a machine gives itself
+#      when DHCP failed, which looks like an address and carries no traffic.
+#
+#   2. Does 8.8.8.8 or 8.8.4.4 answer?
+#      Catches the case the address test cannot see: cable in, router up,
+#      DHCP fine, and no internet behind it.
+#
+# Both must pass to count as online. Anything else raises the access point.
+#
+# This only decides the state AT BOOT. The switch in the app overrides it
+# afterwards in either direction.
+
+set -uo pipefail
+
+PING_TARGETS=("8.8.8.8" "8.8.4.4")
+CAMERA_AP="/usr/local/sbin/camera-ap"
+
+log() { echo "camera-ap-autostart: $*"; }
+
+has_real_address() {
+    # Every global-scope IPv4 the kernel knows about, minus loopback and minus
+    # the self-assigned 169.254/16 range.
+    ip -4 -br addr show scope global 2>/dev/null \
+        | awk '{for (i = 3; i <= NF; i++) print $i}' \
+        | cut -d/ -f1 \
+        | grep -qvE '^(127\.|169\.254\.)'
+}
+
+can_reach_internet() {
+    for target in "${PING_TARGETS[@]}"; do
+        if ping -c 1 -W 3 "$target" >/dev/null 2>&1; then
+            log "reached $target"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if ! has_real_address; then
+    log "no usable IPv4 address on any interface -> starting the access point"
+    exec "$CAMERA_AP" on
+fi
+
+if ! can_reach_internet; then
+    log "have an address but neither ${PING_TARGETS[*]} answered -> starting the access point"
+    exec "$CAMERA_AP" on
+fi
+
+log "network looks fine, leaving the access point off"
+exit 0

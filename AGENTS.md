@@ -111,3 +111,21 @@ Regole di comportamento e sviluppo — Assistente AI
     Verifica il risultato.
     Comunica brevemente l'esito.
     In caso di dubbio, sii collaborativo, concreto e rispettoso.
+
+16. Uso dei subagenti
+    Usa il tool `Task` (subagent) quando il task è:
+    - **Grande/lungo** (> 10 min stimati)
+    - **Isolato** (non dipende da modifiche correnti in corso)
+    - **Parallellizzabile** (più task indipendenti che possono correre insieme)
+    - **Di analisi profonda** su codice esteso o legacy
+
+    Esegui **direttamente** (senza subagent) quando il task è:
+    - **Breve/puntuale** (< 5 min)
+    - **Sequenziale** (dipende da modifiche appena fatte)
+    - **Puntuale** (fix typo, add import, change 1-2 lines)
+    - **Richiede contesto immediato** dalle modifiche correnti
+
+    Esempi **subagent**: "refactor entire detection system", "refactor guided wizard", "fix all camera/sharing/spinner issues", "analyze legacy codebase for bugs"
+    Esempi **diretto**: "change 2 lines in 2 places", "fix typo", "add single import", "verify build passes"
+
+    Regola pratica: se il task può essere completato leggendo ≤ 3 file e scrivendo ≤ 50 righe → diretto. Altrimenti → subagent.
