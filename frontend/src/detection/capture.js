@@ -45,10 +45,8 @@ export function frameToJpeg(media, maxSide = CAPTURE_MAX_SIDE, quality = CAPTURE
  *
  * @param getMedia  called before every frame, so switching source mid-burst
  *                  cannot keep capturing from an element no longer on screen
- * @param onCapture optional, called right after each frame is grabbed (even
- *                  one that came back empty) -- so the page can flash the
- *                  screen at the instant the photo was actually taken,
- *                  rather than at the start of the whole burst.
+ * @param onCapture optional, called after each frame is grabbed so the page
+ *                  can show the shutter flash at the moment of capture
  */
 export async function captureBurst(getMedia, count, gapMs = 400, onCapture) {
   const frames = [];

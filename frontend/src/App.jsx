@@ -641,10 +641,6 @@ function CameraApp({ account, onLoggedOut }) {
   const [captureTotals, setCaptureTotals] = useState({ with: 0, without: 0 });
   const [augmenting, setAugmenting] = useState(false);
   const [clearingGenerated, setClearingGenerated] = useState(false);
-  // Flashed once per frame during a burst, so the moment a photo is actually
-  // taken is visible -- otherwise the only feedback was the button's own
-  // spinner, which says "capturing" for the whole four seconds and never
-  // which instant.
   const [captureFlashOn, setCaptureFlashOn] = useState(false);
   const captureFlashTimeout = useRef(null);
   // The selected classifier's own saved photographs, fetched fresh from the
@@ -679,12 +675,20 @@ function CameraApp({ account, onLoggedOut }) {
   const [captureMode, setCaptureMode] = useState("guided");
   const [guidedOn, setGuidedOn] = useState(false);
   const [guidedStep, setGuidedStep] = useState(0);
-  // What each step has gathered so far, held HERE until the last step ends and
-  // only then sent. Interrompi therefore has nothing to undo on the server: a
-  // run that is abandoned never stored anything.
+  // What each step has gathered so far. A group is uploaded as the user moves
+  // on, so skipping the optional final group cannot discard earlier photos.
   const [guidedShots, setGuidedShots] = useState(() =>
     GUIDED_STEPS.map(() => []),
   );
+  const guidedShotsRef = useRef(guidedShots);
+  const guidedUploadedCountsRef = useRef(GUIDED_STEPS.map(() => 0));
+  const guidedSavedTotalsRef = useRef({
+    with: 0,
+    without: 0,
+    duplicates: 0,
+    removed: 0,
+  });
+  const guidedAdvanceBusyRef = useRef(false);
   const [guidedUploading, setGuidedUploading] = useState(false);
   // The last send failed: the photographs are still here, and the button on the
   // picture says so instead of taking another one.
@@ -1677,9 +1681,6 @@ function CameraApp({ account, onLoggedOut }) {
     return () => mediaDevices.removeEventListener("devicechange", refresh);
   }, [clientIsServer]);
 
-  /** One instant of the capture-burst flash. Re-triggerable mid-flash (a new
-   * frame can land before the previous flash has faded), which is why this
-   * resets the timeout rather than letting an old one turn it off early. */
   function flashCapture() {
     setCaptureFlashOn(true);
     if (captureFlashTimeout.current) clearTimeout(captureFlashTimeout.current);
@@ -1783,7 +1784,17 @@ function CameraApp({ account, onLoggedOut }) {
   }
 
   function guidedReset() {
-    setGuidedShots(GUIDED_STEPS.map(() => []));
+    const emptyShots = GUIDED_STEPS.map(() => []);
+    guidedShotsRef.current = emptyShots;
+    setGuidedShots(emptyShots);
+    guidedUploadedCountsRef.current = GUIDED_STEPS.map(() => 0);
+    guidedSavedTotalsRef.current = {
+      with: 0,
+      without: 0,
+      duplicates: 0,
+      removed: 0,
+    };
+    guidedAdvanceBusyRef.current = false;
     setGuidedStep(0);
     setGuidedRetry(false);
   }
@@ -1816,20 +1827,21 @@ function CameraApp({ account, onLoggedOut }) {
     setGuidedOn(true);
   }
 
-  /** "Interrompi": the run ends and everything taken in it is thrown away. */
+  /** Keep completed uploads; discard anything still pending in the run. */
   function guidedInterrupt() {
     guidedReset();
     setGuidedOn(false);
-    toast("Procedura interrotta: le foto scattate sono state scartate.", {
-      id: TOAST_GUIDED,
-    });
+    toast(
+      "Procedura interrotta: le foto gia' caricate restano salvate; quelle in attesa sono state scartate.",
+      { id: TOAST_GUIDED },
+    );
   }
 
   /** One photograph, for the guided run. Held in the page until the run ends.
    *  The fifth of a step moves the run on by itself. */
   function guidedShot() {
     const step = GUIDED_STEPS[guidedStep];
-    if (!step || guidedUploading) return;
+    if (!step || guidedUploading || guidedAdvanceBusyRef.current) return;
     const media = currentMediaElement();
     const jpeg = frameToJpeg(media);
     if (!jpeg) {
@@ -1839,64 +1851,47 @@ function CameraApp({ account, onLoggedOut }) {
       return;
     }
     flashCapture();
-    const shots = guidedShots.map((list, index) =>
+    const shots = guidedShotsRef.current.map((list, index) =>
       index === guidedStep ? [...list, jpeg] : list,
     );
+    guidedShotsRef.current = shots;
     setGuidedShots(shots);
     if (shots[guidedStep].length >= step.target) guidedAdvance(shots);
   }
 
   /** To the next step, or -- after the last -- to sending everything. Also what
    *  « Salta » and « Avanti » do: a step left short keeps what it has. */
-  function guidedAdvance(shots = guidedShots) {
-    if (guidedStep + 1 < GUIDED_STEPS.length) {
-      setGuidedStep(guidedStep + 1);
-      return;
+  async function guidedUploadStep(index, shots) {
+    const step = GUIDED_STEPS[index];
+    const uploaded = guidedUploadedCountsRef.current[index];
+    const pending = shots[index].slice(uploaded);
+    if (!pending.length) return true;
+
+    const result = await uploadObjectFrames(pending, step.into, { quiet: true });
+    if (result === null) {
+      setGuidedRetry(true);
+      toast.error(
+        "Caricamento non riuscito: le foto restano disponibili. Premi « Riprova ».",
+        { id: TOAST_GUIDED },
+      );
+      return false;
     }
-    guidedFinish(shots);
+
+    guidedUploadedCountsRef.current[index] = shots[index].length;
+    const totals = guidedSavedTotalsRef.current;
+    totals[step.into] += result.saved;
+    totals.duplicates += result.duplicates;
+    totals.removed += result.removed;
+    return true;
   }
 
-  /** Sends the whole run: every « con l'oggetto » photograph, then every
-   *  « senza ». Ten to a request, the server's cap. If a request fails the
-   *  photographs stay and the button becomes « Riprova »; sending again is safe
-   *  because the server refuses a photograph it already has. */
-  async function guidedFinish(shots) {
-    if (guidedUploading) return;
-    if (shots.every((list) => list.length === 0)) {
+  function guidedComplete() {
+    const total = guidedSavedTotalsRef.current;
+    if (guidedShotsRef.current.every((list) => list.length === 0)) {
       toast("Nessuna foto scattata: non c'e' niente da salvare.", {
         id: TOAST_GUIDED,
       });
-      guidedReset();
-      setGuidedOn(false);
-      return;
-    }
-    setGuidedUploading(true);
-    setGuidedRetry(false);
-    try {
-      const total = { with: 0, without: 0, duplicates: 0, removed: 0 };
-      for (const into of ["with", "without"]) {
-        const frames = GUIDED_STEPS.flatMap((step, index) =>
-          step.into === into ? shots[index] : [],
-        );
-        for (let at = 0; at < frames.length; at += IMPORT_BATCH) {
-          const result = await uploadObjectFrames(
-            frames.slice(at, at + IMPORT_BATCH),
-            into,
-            { quiet: true },
-          );
-          if (result === null) {
-            setGuidedRetry(true);
-            toast.error(
-              "Caricamento non riuscito: le foto sono ancora qui. Premi « Riprova ».",
-              { id: TOAST_GUIDED },
-            );
-            return;
-          }
-          total[into] += result.saved;
-          total.duplicates += result.duplicates;
-          total.removed += result.removed;
-        }
-      }
+    } else {
       toast.success(
         `${total.with} foto con l'oggetto e ${total.without} senza salvate${dropped(total)}.` +
           (total.without === 0
@@ -1904,9 +1899,30 @@ function CameraApp({ account, onLoggedOut }) {
             : ""),
         { id: TOAST_GUIDED, duration: 10000 },
       );
-      guidedReset();
-      setGuidedOn(false);
+    }
+    guidedReset();
+    setGuidedOn(false);
+  }
+
+  /** Save the current group before moving on. Thus the optional final group is
+   *  never responsible for saving photographs gathered in earlier steps. */
+  async function guidedAdvance(shots = guidedShotsRef.current) {
+    if (guidedUploading || guidedAdvanceBusyRef.current) return;
+    guidedAdvanceBusyRef.current = true;
+    setGuidedUploading(true);
+    setGuidedRetry(false);
+    try {
+      if (guidedStep + 1 < GUIDED_STEPS.length) {
+        if (!(await guidedUploadStep(guidedStep, shots))) return;
+        setGuidedStep(guidedStep + 1);
+        return;
+      }
+      for (let index = 0; index < GUIDED_STEPS.length; index += 1) {
+        if (!(await guidedUploadStep(index, shots))) return;
+      }
+      guidedComplete();
     } finally {
+      guidedAdvanceBusyRef.current = false;
       setGuidedUploading(false);
     }
   }
@@ -4761,7 +4777,7 @@ function CameraApp({ account, onLoggedOut }) {
               !importedVideo &&
               !localCameraPreview &&
               (cameraDiscoveryPending ? (
-                <div className="pointer-events-none absolute inset-x-6 top-1/2 z-10 flex -translate-y-1/2 items-center justify-center gap-2 rounded-md bg-black/75 px-3 py-2">
+                <div className="pointer-events-none absolute left-1/2 top-1/2 z-10 flex w-fit max-w-[calc(100%-3rem)] -translate-x-1/2 -translate-y-1/2 items-center justify-center gap-2 rounded-md bg-black/75 px-3 py-2">
                   <Loader size="sm" color="white" />
                   <Text size="sm" c="white">
                     Ricerca delle videocamere in corso...
@@ -4949,18 +4965,10 @@ function CameraApp({ account, onLoggedOut }) {
                 Video in pausa (scheda non attiva)
               </div>
             )}
-            {/* The instant a burst frame is taken, like a camera shutter. White
-              rather than a border or badge: it has to register in the corner
-              of your eye while you are busy aiming the camera at the object,
-              not be something you have to look for. Instant on, fading out
-              over the transition below -- symmetric only because a one-shot
-              flash is brief enough either way that the difference does not
-              read. pointer-events-none: it must never intercept the pinch
-              gesture also handled on this video. */}
-            {capturing && (
+            {(capturing || captureFlashOn) && (
               <div
                 className={
-                  "absolute inset-0 pointer-events-none bg-white transition-opacity duration-150 " +
+                  "pointer-events-none absolute inset-0 bg-white transition-opacity duration-150 " +
                   (captureFlashOn ? "opacity-70" : "opacity-0")
                 }
               />
@@ -5212,12 +5220,8 @@ function CameraApp({ account, onLoggedOut }) {
                             variant="filled"
                             color={guidedRetry ? "orange" : "green"}
                             loading={guidedUploading}
-                            disabled={capturing}
-                            onClick={
-                              guidedRetry
-                                ? () => guidedFinish(guidedShots)
-                                : guidedShot
-                            }
+                            disabled={capturing || guidedUploading}
+                            onClick={guidedRetry ? () => guidedAdvance() : guidedShot}
                           >
                             {guidedRetry
                               ? "Riprova"
@@ -5642,8 +5646,8 @@ function CameraApp({ account, onLoggedOut }) {
                               <Text size="xs" c="dimmed">
                                 Il pulsante Scatta e la descrizione sono sullo
                                 schermo principale. Dopo 5 foto si passa al
-                                passo successivo; le foto vengono salvate alla
-                                fine dell'ultimo passo.
+                                passo successivo e le foto raccolte vengono
+                                salvate; l'ultimo gruppo « Simili » e' facoltativo.
                               </Text>
                               <Group gap="xs">
                                 <Button

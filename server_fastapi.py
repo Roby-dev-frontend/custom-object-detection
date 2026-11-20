@@ -4372,6 +4372,22 @@ def _jpeg_bytes(encoded: str) -> Optional[bytes]:
         return None
 
 
+def _decode_images(images: List[str]) -> List[np.ndarray]:
+    """Decode readable base64 images, skipping invalid frames in a batch."""
+    frames = []
+    for image in images:
+        raw = _jpeg_bytes(image)
+        if not raw:
+            continue
+        try:
+            frame = cv2.imdecode(np.frombuffer(raw, dtype=np.uint8), cv2.IMREAD_COLOR)
+        except cv2.error:
+            continue
+        if frame is not None:
+            frames.append(frame)
+    return frames
+
+
 #: How long a person's read waits for the reader before it is refused: a
 #: background read of the live text takes up to about 8 s.
 OCR_WAIT_SECONDS = 15.0
